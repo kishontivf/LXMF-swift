@@ -21,21 +21,17 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Pinned to reticulum-swift 0.3.0 — the release that drops
-        // `destinationHash` from `sendLinkData` (breaking) and aligns
-        // link DATA send with python parity. Floor must be ≥ 0.3.0
-        // because LXMF-swift now uses the new `sendLinkData(packet:)`
-        // signature; an older reticulum-swift would not compile.
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.3.0"),
+        .package(url: "https://github.com/kishontivf/reticulum-swift.git", from: "0.1.1"),
+        // .package(path: "../reticulum-swift"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
-        // Cap below 4.9.0: SWCompression 4.9.0 raised its floor to macOS 14 / iOS 17,
+        // Pin exactly to 4.8.7: SWCompression 4.9.0 raised its floor to macOS 14 / iOS 17,
         // above this library's macOS 13 / iOS 16 (which matches the sibling ports
         // reticulum-swift + LXST-swift and Columba's iOS 16 device-support floor).
         // `Package.resolved` is gitignored, so CI's `swift package resolve` otherwise
         // picks the latest (4.9.0) and fails the build with a platform conflict. Raising
         // the suite to iOS 17 would drop iOS 16 devices — a user-facing call, not a CI
-        // hygiene one — so pin to the 4.8.x line (4.8.7 is macOS 10.13 / iOS 11) instead.
-        .package(url: "https://github.com/tsolomko/SWCompression.git", "4.8.0" ..< "4.9.0"),
+        // hygiene one — so pin to 4.8.7 (macOS 10.13 / iOS 11) instead.
+        .package(url: "https://github.com/tsolomko/SWCompression.git", exact: "4.8.7"),
     ],
     targets: [
         .target(

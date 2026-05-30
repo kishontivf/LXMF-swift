@@ -74,7 +74,21 @@ public actor LXMFDatabase {
         }
         #endif
 
-        // Run migrations
+        // Run migrations. Only the writer runs them: GRDB's migrator issues an
+        // internal `write {}` to atomically check/apply schema versions, which
+        // returns SQLITE_READONLY (throws) on a read-only pool. Under Model B the
+        // writer (the NE) owns the schema; the read-only app reader just opens the
+        // already-migrated store, so migrating from it would throw at init before
+        // any read could happen.
+        if !readonly {
+            try Self.makeMigrator().migrate(dbPool)
+        }
+    }
+
+    /// Builds the schema migrator. Shared between `init` (open + migrate) and
+    /// `importDatabase` (forward-migrate a restored snapshot that may have been
+    /// taken on an older schema version).
+    private static func makeMigrator() -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
 
         // v1: Initial schema
@@ -172,14 +186,39 @@ public actor LXMFDatabase {
             try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
         }
 
-        // Only the writer runs migrations: GRDB's migrator issues an internal
-        // `write {}` to atomically check/apply schema versions, which returns
-        // SQLITE_READONLY (throws) on a read-only pool. Under Model B the writer (the
-        // NE) owns the schema; the read-only app reader just opens the already-migrated
-        // store, so migrating from it would throw at init before any read could happen.
-        if !readonly {
-            try migrator.migrate(dbPool)
+        return migrator
+    }
+
+    // MARK: - Backup / Restore
+
+    /// Writes a consistent, self-contained snapshot of the database to `path`
+    /// using SQLite `VACUUM INTO`. The result is a single file with no WAL/SHM
+    /// sidecars, safe to produce while the database is live (it reads the
+    /// committed state, including anything still in the WAL). The destination
+    /// file must NOT already exist.
+    ///
+    /// - Parameter path: Destination file path for the snapshot.
+    /// - Throws: DatabaseError if the export fails.
+    public func exportDatabase(to path: String) throws {
+        try dbPool.writeWithoutTransaction { db in
+            try db.execute(sql: "VACUUM INTO ?", arguments: [path])
         }
+    }
+
+    /// Replaces the entire contents of this database with the snapshot at
+    /// `path`. Copies every page from the source into the live pool, so the
+    /// on-disk file and all existing connections (including the router's) keep
+    /// pointing at the same path and observe the restored data on their next
+    /// transaction — no reopen required. The schema migrator runs afterwards
+    /// so a snapshot taken on an older schema version is forward-migrated. All
+    /// current conversations and messages are discarded.
+    ///
+    /// - Parameter path: Source snapshot to restore from.
+    /// - Throws: DatabaseError if the source can't be opened or the restore fails.
+    public func importDatabase(from path: String) throws {
+        let source = try DatabaseQueue(path: path)
+        try source.backup(to: dbPool)
+        try Self.makeMigrator().migrate(dbPool)
     }
 
     // MARK: - Message Operations
