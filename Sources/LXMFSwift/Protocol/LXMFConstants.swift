@@ -94,9 +94,37 @@ public enum LXMFConstants {
     /// = 431 - 112 = 319
     public static let LINK_PACKET_MAX_CONTENT = 319
 
-    /// Maximum content size for resource-based transfers
-    /// Python: No explicit limit, uses Int.max
-    public static let RESOURCE_MAX_CONTENT = Int.max
+    /// Maximum content size for resource-based transfers.
+    ///
+    /// Python uses no explicit limit (Int.max), but an unbounded value lets a
+    /// malicious peer drive the decoder/storage into an out-of-memory crash.
+    /// Cap at 4 MiB, which is comfortably above any legitimate LXMF message
+    /// content while bounding attacker-controlled allocation.
+    public static let RESOURCE_MAX_CONTENT = 4 * 1024 * 1024
+
+    // MARK: - Inbound Hardening Limits
+
+    /// Maximum total packed size of an inbound LXMF message (header + payload),
+    /// in bytes. Messages larger than this are rejected before unpacking the
+    /// payload, bounding both decode work and storage. 8 MiB leaves headroom
+    /// over `INBOUND_MAX_CONTENT` plus fields/attachments.
+    public static let INBOUND_MAX_PACKED_SIZE = 8 * 1024 * 1024
+
+    /// Maximum decoded content length of an inbound LXMF message, in bytes.
+    /// Mirrors `RESOURCE_MAX_CONTENT` (4 MiB) — content is the largest single
+    /// scalar field and must not exceed it.
+    public static let INBOUND_MAX_CONTENT = 4 * 1024 * 1024
+
+    /// Maximum number of fields (top-level entries in the LXMF fields map) on an
+    /// inbound message. LXMF defines only a low single-digit count of field IDs;
+    /// 128 is a generous bound that rejects a map-flood DoS.
+    public static let INBOUND_MAX_FIELDS = 128
+
+    /// Maximum size of a single inbound field blob (e.g. an attachment), in
+    /// bytes. Caps any one field's contribution so the sum of fields can't be
+    /// used to bypass the per-message content limit. 4 MiB matches
+    /// `INBOUND_MAX_CONTENT`.
+    public static let INBOUND_MAX_FIELD_BLOB_SIZE = 4 * 1024 * 1024
 
     /// Maximum data unit for plain (unencrypted) packets
     /// Python: PLAIN_PACKET_MDU = RNS.Packet.PLAIN_MDU = 464

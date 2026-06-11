@@ -235,6 +235,10 @@ extension LXMRouter {
 
         // Mark as sent
         message.state = .sent
+        // Record the wire the packet went out on. `send(packet:)` routed via
+        // the same selection this queries, so barring a path change in the
+        // gap this is the interface that carried the packet.
+        message.sentInterface = await transport.preferredOutboundInterfaceId(for: message.destinationHash)
 
         // Track for rescue: if the proof never arrives (path died, packet
         // lost), the message is re-enqueued on path-lost events or when the
@@ -242,7 +246,8 @@ extension LXMRouter {
         awaitingConfirmation[msgHash] = PendingConfirmation(
             destinationHash: message.destinationHash,
             packetTruncatedHash: packetTruncatedHash,
-            deadline: Date().addingTimeInterval(LXMFConstants.DELIVERY_CONFIRMATION_TIMEOUT)
+            deadline: Date().addingTimeInterval(LXMFConstants.DELIVERY_CONFIRMATION_TIMEOUT),
+            sentInterface: message.sentInterface
         )
 
         // Notify delegate
@@ -306,6 +311,7 @@ extension LXMRouter {
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             directSendLogger.info("link established: linkId=\(linkIdHex)")
             directDbgLogger.notice("[DIRECT-DBG] sendDirect: link active linkId=\(linkIdHex, privacy: .public) → will send data + register proof")
+            message.sentInterface = await link.attachedInterfaceId
         } catch {
             directSendLogger.error("link establishment failed: \(error)")
             directDbgLogger.notice("[DIRECT-DBG] sendDirect: link establishment FAILED to \(destHashHex, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -404,7 +410,8 @@ extension LXMRouter {
             awaitingConfirmation[message.hash] = PendingConfirmation(
                 destinationHash: message.destinationHash,
                 packetTruncatedHash: packet.getTruncatedHash(),
-                deadline: Date().addingTimeInterval(LXMFConstants.DELIVERY_CONFIRMATION_TIMEOUT)
+                deadline: Date().addingTimeInterval(LXMFConstants.DELIVERY_CONFIRMATION_TIMEOUT),
+                sentInterface: message.sentInterface
             )
             usedResourcePath = false
         } else {
@@ -493,8 +500,21 @@ extension LXMRouter {
         // over the indirect path; small follow-up sends simply reuse the
         // new TCP link.
         if let link = deliveryLinks[destinationHash], await link.state == .active {
-            if routeHint == .preferIndirect,
-               let attached = await link.attachedInterfaceId,
+            // A link can report .active long after its wire died (keepalive
+            // staleness takes minutes): if the attached interface is gone or
+            // no longer connected, the link is a zombie — drop it and
+            // establish fresh over whatever selection now picks.
+            let attachedId = await link.attachedInterfaceId
+            let attachedConnected: Bool = await {
+                guard let attachedId else { return true } // pre-proof link: nothing to check yet
+                return await transport.getInterface(id: attachedId)?.state == .connected
+            }()
+            if !attachedConnected {
+                directDbgLogger.notice("[DIRECT-DBG] evicting zombie link to \(destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public): attached interface '\(attachedId ?? "?", privacy: .public)' not connected")
+                await link.invalidate(reason: .attachedInterfaceClosed)
+                deliveryLinks.removeValue(forKey: destinationHash)
+            } else if routeHint == .preferIndirect,
+               let attached = attachedId,
                await transport.linkClass(ofInterface: attached) == .direct {
                 directDbgLogger.notice("[DIRECT-DBG] re-establishing link to \(destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public): cached link on direct wire '\(attached, privacy: .public)', large transfer prefers indirect")
                 await link.close(reason: .initiatorClosed)
@@ -618,6 +638,11 @@ extension LXMRouter {
         // Get local identity for link initiation (from LXMRouter's identity)
         let localIdentity = getLinkIdentity()
 
+        // Capture the wire the LINKREQUEST is about to take so an
+        // establishment timeout can be charged against that specific path —
+        // the retry then rotates onto a different interface.
+        let plannedInterface = await transport.preferredOutboundInterfaceId(for: destinationHash)
+
         // Use transport's initiateLink which properly registers the link
         // in pendingLinks so PROOF packets can be routed to it
         let link: Link
@@ -626,6 +651,7 @@ extension LXMRouter {
             let linkId = await link.linkId
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
         } catch {
+            await transport.reportDeliveryFailure(for: destinationHash, interfaceId: plannedInterface)
             throw error
         }
 
@@ -647,6 +673,9 @@ extension LXMRouter {
             routerLogger.warning("Cleaning up stale pending link \(linkIdHex)")
             await transport.unregisterLink(linkId: linkId)
             deliveryLinks.removeValue(forKey: destinationHash)
+            // No PROOF over the planned wire — demote it so the retry tries
+            // the other class (e.g. cached-route TCP dead → BLE next).
+            await transport.reportDeliveryFailure(for: destinationHash, interfaceId: plannedInterface)
             throw error
         }
 

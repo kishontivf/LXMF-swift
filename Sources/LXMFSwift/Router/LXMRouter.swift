@@ -138,6 +138,10 @@ public actor LXMRouter {
         /// registered proof callback when the message is rescued.
         let packetTruncatedHash: Data
         let deadline: Date
+        /// Interface the send went out on — reported back to the transport
+        /// as a delivery failure when the proof never arrives, so the retry
+        /// rotates onto a different wire.
+        let sentInterface: String?
     }
     var awaitingConfirmation: [Data: PendingConfirmation] = [:]
 
@@ -467,6 +471,17 @@ public actor LXMRouter {
             awaitingConfirmation.removeValue(forKey: messageHash)
             await transport?.removeProofCallback(truncatedHash: pending.packetTruncatedHash)
 
+            // The send went out but was never proven — treat the wire it
+            // used as suspect so the retry selects a different path, and
+            // drop any cached link to the destination (it's the prime
+            // suspect: a locally-"active" link whose far side is gone).
+            if let suspectInterface = pending.sentInterface {
+                await transport?.reportDeliveryFailure(for: pending.destinationHash, interfaceId: suspectInterface)
+            }
+            if let suspectLink = deliveryLinks.removeValue(forKey: pending.destinationHash) {
+                await suspectLink.invalidate(reason: .attachedInterfaceClosed)
+            }
+
             let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             guard var message = try? await database.getMessage(id: messageHash) else {
                 routerLogger.warning("Cannot rescue \(msgHex, privacy: .public): DB lookup failed")
@@ -660,8 +675,24 @@ public actor LXMRouter {
             }
 
             // Look up source identity from cache for signature validation
-            let sourceIdentity = identityCache[sourceHash]
-            routerLogger.info("source=\(srcHex), identityCached=\(sourceIdentity != nil)")
+            var sourceIdentity = identityCache[sourceHash]
+
+            // If the source isn't in the identity cache, try to resolve it from
+            // the path table. Announces register a destination's public keys
+            // there; the LXMF source hash IS the source's delivery destination
+            // hash (same key space as `registerIdentity`), so a path entry lets
+            // us reconstruct the identity and verify the Ed25519 signature. This
+            // is what enables legitimate first-contact: we may not have called
+            // `registerIdentity` yet, but if we have a path we have the keys.
+            if sourceIdentity == nil, let pathTable = self.pathTable {
+                if let pathEntry = await pathTable.lookup(destinationHash: sourceHash),
+                   let resolved = try? Identity(publicKeyBytes: pathEntry.publicKeys) {
+                    sourceIdentity = resolved
+                    // Cache for subsequent messages from this source.
+                    identityCache[sourceHash] = resolved
+                }
+            }
+            routerLogger.info("source=\(srcHex), identityResolved=\(sourceIdentity != nil)")
 
             // Unpack message from wire format, passing source identity if known
             var message = try LXMessage.unpackFromBytes(data, sourceIdentity: sourceIdentity)
@@ -676,10 +707,21 @@ public actor LXMRouter {
                 message.method = method
             }
 
-            // Validate signature (silent drop if invalid, per Python behavior)
-            // If source identity is unknown, accept but mark unverified
-            if message.signatureValidated == false && message.unverifiedReason == .signatureInvalid {
-                routerLogger.warning("REJECTED: invalid signature from \(srcHex)")
+            // Require a verified Ed25519 signature for ALL network-delivered
+            // messages (both OPPORTUNISTIC/DIRECT and PROPAGATED). `sourceHash`
+            // is fully attacker-controlled, so a message whose signature has not
+            // been verified against the resolved source identity must never be
+            // stored or surfaced to the delegate as trusted. This rejects both
+            // an outright bad signature (`.signatureInvalid`) and the case where
+            // the source identity could not be resolved at all (`.sourceUnknown`,
+            // leaving `signatureValidated == false`).
+            //
+            // Note: locally injected messages (`LXMessage.makeLocal`) carry a
+            // placeholder zero signature and `signatureValidated == false`, but
+            // they are persisted directly by the app and never flow through
+            // `lxmfDelivery`, so they are unaffected by this gate.
+            if message.signatureValidated == false {
+                routerLogger.warning("REJECTED: unverified signature from \(srcHex) (reason=\(String(describing: message.unverifiedReason)))")
                 return false
             }
 
@@ -890,7 +932,7 @@ public actor LXMRouter {
                         // Update database
                         let sentMsg = pendingOutbound[i]
                         Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
+                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent, sentInterface: sentMsg.sentInterface)
                         }
                     }
 
@@ -950,7 +992,7 @@ public actor LXMRouter {
                             outboundSnapshot.state = .outbound
                             try? await database.saveMessage(outboundSnapshot)
                         } else {
-                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
+                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state, sentInterface: snapshot.sentInterface)
                         }
                     } else {
                         // Need path first
@@ -1091,7 +1133,7 @@ public actor LXMRouter {
                             // `saveMessage(.outbound)` clobbered the
                             // `.sent` state for small-packet successes,
                             // causing duplicate-propagation on restart.
-                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
+                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state, sentInterface: snapshot.sentInterface)
                         }
                     } else {
                         requestPath(nodeHash)
@@ -1191,8 +1233,12 @@ public actor LXMRouter {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.error("Delivery proof received for message \(hashHex, privacy: .public)")
 
-        // Confirmation arrived — stop tracking for rescue.
-        awaitingConfirmation.removeValue(forKey: messageHash)
+        // Confirmation arrived — stop tracking for rescue, and tell the
+        // transport the wire works so any demotion from an earlier failed
+        // attempt is lifted.
+        if let confirmed = awaitingConfirmation.removeValue(forKey: messageHash) {
+            await transport?.reportDeliverySuccess(for: confirmed.destinationHash, interfaceId: confirmed.sentInterface)
+        }
 
         // Late-proof race: if the message was already rescued back into
         // pendingOutbound (path-lost or deadline), flip its in-memory state
@@ -1553,6 +1599,22 @@ public actor LXMRouter {
             // and the catch-block scaling should be re-aligned
             // together (and a unified deviation note added).
             msg.state = .outbound
+            // DIRECT only: the wire the transfer died on is suspect —
+            // demote it and drop the cached link so the retry re-selects,
+            // typically flipping a stalled relay-TCP transfer onto the live
+            // BLE/MPC path (or vice versa) instead of re-feeding the same
+            // dead pipe. (PROPAGATED failures talk to the propagation node
+            // over `propagationLinks`; demoting the *recipient's* paths for
+            // a PN-link failure would punish the wrong route.)
+            if !wasPropagation {
+                if let suspectLink = deliveryLinks.removeValue(forKey: msg.destinationHash) {
+                    let suspectInterface = await suspectLink.attachedInterfaceId
+                    await transport?.reportDeliveryFailure(for: msg.destinationHash, interfaceId: suspectInterface)
+                    await suspectLink.invalidate(reason: .attachedInterfaceClosed)
+                } else if let suspectInterface = msg.sentInterface {
+                    await transport?.reportDeliveryFailure(for: msg.destinationHash, interfaceId: suspectInterface)
+                }
+            }
             // Path-aware backoff: with multi-path transport, an interface
             // loss mid-transfer usually leaves a surviving path (e.g. TCP
             // after BLE walked away) — retry fast over it. Only when no

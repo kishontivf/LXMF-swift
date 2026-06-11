@@ -84,6 +84,9 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
     /// Human-readable name of the interface that received this message
     public var receivingInterface: String?
 
+    /// Id of the interface this message was sent over (outbound only)
+    public var sentInterface: String?
+
     /// ID of the message this is a reply to (optional)
     public var replyToId: String?
 
@@ -122,6 +125,7 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         case q
         case ratchetId = "ratchet_id"
         case receivingInterface = "receiving_interface"
+        case sentInterface = "sent_interface"
         case replyToId = "reply_to_id"
         case reactionsJson = "reactions_json"
         case packedLxmf = "packed_lxmf"
@@ -169,6 +173,7 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         self.q = message.q
         self.ratchetId = nil
         self.receivingInterface = message.receivingInterface
+        self.sentInterface = message.sentInterface
 
         // Extract reply_to from FIELD_APP_DATA (field 0x10)
         if let appData = message.fields?[LXMessage.FIELD_APP_DATA] as? [String: Any],
@@ -211,6 +216,10 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
 
         // Restore delivery attempts (prevents infinite retry across restarts)
         message.deliveryAttempts = deliveryAttempts
+
+        // Restore interface metadata (not part of the wire format)
+        message.receivingInterface = receivingInterface
+        message.sentInterface = sentInterface
 
         return message
     }

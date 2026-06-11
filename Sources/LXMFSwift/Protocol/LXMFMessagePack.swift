@@ -224,7 +224,18 @@ public func unpackLXMF<D: DataProtocol>(_ data: D) throws -> LXMFMessagePackValu
     return try decodeValue(from: fullData, at: &offset)
 }
 
-private func decodeValue(from data: Data, at offset: inout Int) throws -> LXMFMessagePackValue {
+/// Maximum nesting depth for decoded MessagePack containers.
+///
+/// MessagePack from an untrusted peer can nest arrays/maps arbitrarily deep
+/// (e.g. a stream of 0x91 fixarray-of-1 bytes), recursing `decodeValue` once per
+/// level until the stack overflows — an uncatchable remote crash. 64 is far
+/// deeper than any legitimate LXMF payload.
+private let lxmfMessagePackMaxDepth = 64
+
+private func decodeValue(from data: Data, at offset: inout Int, depth: Int = 0) throws -> LXMFMessagePackValue {
+    guard depth <= lxmfMessagePackMaxDepth else {
+        throw LXMFError.decodingFailed("Maximum nesting depth exceeded")
+    }
     guard offset < data.count else {
         throw LXMFError.decodingFailed("Unexpected end of data")
     }
@@ -240,13 +251,13 @@ private func decodeValue(from data: Data, at offset: inout Int) throws -> LXMFMe
     // Fixmap (0x80 - 0x8f)
     if byte >= 0x80 && byte <= 0x8f {
         let count = Int(byte & 0x0f)
-        return try decodeMap(count: count, from: data, at: &offset)
+        return try decodeMap(count: count, from: data, at: &offset, depth: depth)
     }
 
     // Fixarray (0x90 - 0x9f)
     if byte >= 0x90 && byte <= 0x9f {
         let count = Int(byte & 0x0f)
-        return try decodeArray(count: count, from: data, at: &offset)
+        return try decodeArray(count: count, from: data, at: &offset, depth: depth)
     }
 
     // Fixstr (0xa0 - 0xbf)
@@ -323,18 +334,18 @@ private func decodeValue(from data: Data, at offset: inout Int) throws -> LXMFMe
     // Array
     case 0xdc:
         let count = Int(try readUInt16(from: data, at: &offset))
-        return try decodeArray(count: count, from: data, at: &offset)
+        return try decodeArray(count: count, from: data, at: &offset, depth: depth)
     case 0xdd:
         let count = Int(try readUInt32(from: data, at: &offset))
-        return try decodeArray(count: count, from: data, at: &offset)
+        return try decodeArray(count: count, from: data, at: &offset, depth: depth)
 
     // Map
     case 0xde:
         let count = Int(try readUInt16(from: data, at: &offset))
-        return try decodeMap(count: count, from: data, at: &offset)
+        return try decodeMap(count: count, from: data, at: &offset, depth: depth)
     case 0xdf:
         let count = Int(try readUInt32(from: data, at: &offset))
-        return try decodeMap(count: count, from: data, at: &offset)
+        return try decodeMap(count: count, from: data, at: &offset, depth: depth)
 
     default:
         throw LXMFError.decodingFailed("Unknown MessagePack type: 0x\(String(byte, radix: 16))")
@@ -408,21 +419,33 @@ private func decodeBinary(length: Int, from data: Data, at offset: inout Int) th
     return .binary(bytes)
 }
 
-private func decodeArray(count: Int, from data: Data, at offset: inout Int) throws -> LXMFMessagePackValue {
+private func decodeArray(count: Int, from data: Data, at offset: inout Int, depth: Int) throws -> LXMFMessagePackValue {
+    // Every element consumes at least one byte, so a legitimate count can never
+    // exceed the bytes remaining. This guards `reserveCapacity` against an
+    // attacker-supplied huge count (e.g. 0xdd ff ff ff ff) triggering a
+    // multi-gigabyte allocation before any element is read.
+    guard count >= 0, count <= data.count - offset else {
+        throw LXMFError.decodingFailed("Array count exceeds available data")
+    }
     var elements: [LXMFMessagePackValue] = []
     elements.reserveCapacity(count)
     for _ in 0..<count {
-        elements.append(try decodeValue(from: data, at: &offset))
+        elements.append(try decodeValue(from: data, at: &offset, depth: depth + 1))
     }
     return .array(elements)
 }
 
-private func decodeMap(count: Int, from data: Data, at offset: inout Int) throws -> LXMFMessagePackValue {
+private func decodeMap(count: Int, from data: Data, at offset: inout Int, depth: Int) throws -> LXMFMessagePackValue {
+    // Each entry is a key + value, so it consumes at least two bytes; bound the
+    // count by remaining bytes to prevent an oversized `reserveCapacity`.
+    guard count >= 0, count <= (data.count - offset) / 2 else {
+        throw LXMFError.decodingFailed("Map count exceeds available data")
+    }
     var map: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
     map.reserveCapacity(count)
     for _ in 0..<count {
-        let key = try decodeValue(from: data, at: &offset)
-        let value = try decodeValue(from: data, at: &offset)
+        let key = try decodeValue(from: data, at: &offset, depth: depth + 1)
+        let value = try decodeValue(from: data, at: &offset, depth: depth + 1)
         map[key] = value
     }
     return .map(map)

@@ -150,6 +150,13 @@ public actor LXMFDatabase {
             try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
         }
 
+        // v7: Add sent_interface column to messages
+        migrator.registerMigration("v7_add_sent_interface") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "sent_interface", .text)
+            }
+        }
+
         return migrator
     }
 
@@ -262,13 +269,23 @@ public actor LXMFDatabase {
     /// - Parameters:
     ///   - id: Message hash (32 bytes)
     ///   - state: New state
+    ///   - sentInterface: When non-nil, also records the interface the
+    ///     message went out on, so the state-column-only write used by the
+    ///     post-send persistence sites doesn't drop the routing metadata.
     /// - Throws: DatabaseError
-    public func updateMessageState(id: Data, state: LXMessageState) throws {
+    public func updateMessageState(id: Data, state: LXMessageState, sentInterface: String? = nil) throws {
         try dbPool.write { db in
-            try db.execute(
-                sql: "UPDATE messages SET state = ?, updated_at = ? WHERE message_id = ?",
-                arguments: [state.rawValue, Date().timeIntervalSince1970, id]
-            )
+            if let sentInterface {
+                try db.execute(
+                    sql: "UPDATE messages SET state = ?, sent_interface = ?, updated_at = ? WHERE message_id = ?",
+                    arguments: [state.rawValue, sentInterface, Date().timeIntervalSince1970, id]
+                )
+            } else {
+                try db.execute(
+                    sql: "UPDATE messages SET state = ?, updated_at = ? WHERE message_id = ?",
+                    arguments: [state.rawValue, Date().timeIntervalSince1970, id]
+                )
+            }
         }
     }
 

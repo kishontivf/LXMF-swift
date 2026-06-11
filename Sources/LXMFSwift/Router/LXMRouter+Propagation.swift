@@ -153,6 +153,7 @@ extension LXMRouter {
 
         // Get or establish link to propagation node
         let link = try await getOrEstablishPropagationLink(to: propagationNode, transport: transport)
+        message.sentInterface = await link.attachedInterfaceId
 
         // Do NOT identify on the delivery link.
         //

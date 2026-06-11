@@ -46,7 +46,17 @@ final class LXMFResourceHandler: ResourceCallbacks, @unchecked Sendable {
         // Resource transfers always travel over an established link, so this is
         // unambiguously a DIRECT delivery. Python: delivery_resource_concluded()
         // calls lxmf_delivery(..., method=LXMessage.DIRECT). LXMRouter.py:1878.
-        let accepted = await router.lxmfDelivery(data, method: .direct)
+        //
+        // Attribute the receiving interface from the link that carried the
+        // resource — without it, consumers fall back to announce-path info,
+        // which can name a different wire than the one the bytes took (e.g.
+        // announce heard over MPC while the transfer ran over TCP).
+        var stats: PhysicalStats? = nil
+        if let link = await resource.link,
+           let receivingInterface = await link.attachedInterfaceId {
+            stats = PhysicalStats(receivingInterface: receivingInterface)
+        }
+        let accepted = await router.lxmfDelivery(data, physicalStats: stats, method: .direct)
         routerLogger.info("lxmfDelivery returned accepted=\(accepted)")
     }
 }

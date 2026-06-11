@@ -170,18 +170,30 @@ public struct LocationTelemetry: Equatable, Sendable {
     }
 
     /// Unpack 4-byte big-endian Data to Int32.
+    ///
+    /// Assembles the value byte-wise instead of `load(as:)`, which requires the
+    /// buffer to be 4-byte aligned and reads a fixed width regardless of slice
+    /// length — both unsafe on an arbitrary `Data` slice. Returns 0 on short
+    /// input. `data` may be a slice, so index from `startIndex`.
     private static func unpackInt32(_ data: Data) -> Int32 {
-        data.withUnsafeBytes { $0.load(as: Int32.self).bigEndian }
+        Int32(bitPattern: unpackUInt32(data))
     }
 
     /// Unpack 4-byte big-endian Data to UInt32.
     private static func unpackUInt32(_ data: Data) -> UInt32 {
-        data.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        guard data.count >= 4 else { return 0 }
+        let i = data.startIndex
+        return UInt32(data[i]) << 24
+            | UInt32(data[i + 1]) << 16
+            | UInt32(data[i + 2]) << 8
+            | UInt32(data[i + 3])
     }
 
     /// Unpack 2-byte big-endian Data to UInt16.
     private static func unpackUInt16(_ data: Data) -> UInt16 {
-        data.withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+        guard data.count >= 2 else { return 0 }
+        let i = data.startIndex
+        return UInt16(data[i]) << 8 | UInt16(data[i + 1])
     }
 }
 

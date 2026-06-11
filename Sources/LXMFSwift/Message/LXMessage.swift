@@ -122,6 +122,12 @@ public struct LXMessage {
     /// Human-readable name of the interface that received this message
     public var receivingInterface: String?
 
+    /// Id of the interface this message was sent over (for outbound messages).
+    /// Set when the send actually happens — opportunistic sends record the
+    /// transport's selected outbound interface, link-based sends record the
+    /// link's attached interface.
+    public var sentInterface: String?
+
     // MARK: - Initialization
 
     /// Create new outbound message.
@@ -369,6 +375,12 @@ public struct LXMessage {
             throw LXMFError.invalidMessageFormat("Message too short")
         }
 
+        // Reject oversized inbound messages up front, before decoding the
+        // payload, to bound attacker-controlled decode and storage work.
+        guard data.count <= LXMFConstants.INBOUND_MAX_PACKED_SIZE else {
+            throw LXMFError.invalidMessageFormat("Message too large (\(data.count) > \(LXMFConstants.INBOUND_MAX_PACKED_SIZE))")
+        }
+
         // Extract header components
         let destinationHash = data.prefix(LXMFConstants.DESTINATION_LENGTH)
         let sourceHash = data.dropFirst(LXMFConstants.DESTINATION_LENGTH).prefix(LXMFConstants.DESTINATION_LENGTH)
@@ -441,6 +453,12 @@ public struct LXMessage {
             throw LXMFError.invalidMessageFormat("Invalid content type: \(payloadArray[2])")
         }
 
+        // Bound decoded content length to prevent oversized inbound payloads
+        // from being stored / surfaced.
+        guard content.count <= LXMFConstants.INBOUND_MAX_CONTENT else {
+            throw LXMFError.invalidMessageFormat("Content too large (\(content.count) > \(LXMFConstants.INBOUND_MAX_CONTENT))")
+        }
+
         // Fields can be nil or map
         // DEBUG: Log raw fields value from msgpack to diagnose telemetry loss
         let fieldsRaw = payloadArray[3]
@@ -462,6 +480,10 @@ public struct LXMessage {
 
         var fields: [UInt8: Any]? = nil
         if case .map(let fieldsMap) = payloadArray[3] {
+            // Bound the number of fields to reject a map-flood DoS.
+            guard fieldsMap.count <= LXMFConstants.INBOUND_MAX_FIELDS else {
+                throw LXMFError.invalidMessageFormat("Too many fields (\(fieldsMap.count) > \(LXMFConstants.INBOUND_MAX_FIELDS))")
+            }
             var extractedFields: [UInt8: Any] = [:]
             for (key, value) in fieldsMap {
                 // Extract field key — handle both .uint and .int keys
@@ -477,6 +499,11 @@ public struct LXMessage {
                 // Extract value
                 switch value {
                 case .binary(let data):
+                    // Cap any single field blob so the sum of fields can't be
+                    // used to bypass the per-message content limit.
+                    guard data.count <= LXMFConstants.INBOUND_MAX_FIELD_BLOB_SIZE else {
+                        throw LXMFError.invalidMessageFormat("Field 0x\(String(keyByte, radix: 16)) blob too large (\(data.count) > \(LXMFConstants.INBOUND_MAX_FIELD_BLOB_SIZE))")
+                    }
                     extractedFields[keyByte] = data
                 case .string(let str):
                     extractedFields[keyByte] = str

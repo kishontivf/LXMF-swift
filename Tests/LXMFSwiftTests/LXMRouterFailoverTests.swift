@@ -346,7 +346,8 @@ extension LXMRouter {
         awaitingConfirmation[messageHash] = PendingConfirmation(
             destinationHash: destinationHash,
             packetTruncatedHash: packetTruncatedHash,
-            deadline: deadline
+            deadline: deadline,
+            sentInterface: nil
         )
     }
 
