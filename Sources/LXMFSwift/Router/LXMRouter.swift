@@ -248,6 +248,28 @@ public actor LXMRouter {
     /// Populated by registerIdentity() or from announces.
     private var identityCache: [Data: Identity] = [:]
 
+    /// Whether to accept inbound messages whose signature could not be verified
+    /// because the source identity is not yet known (`.sourceUnknown`).
+    ///
+    /// Default `false`: such messages are dropped before they touch the database
+    /// or the delegate, because their `sourceHash` is unauthenticated and could
+    /// be spoofed. The drop happens before dedup recording, so it is transient —
+    /// once the source's identity is recalled (`registerIdentity`, typically from
+    /// an announce) the sender's retry verifies and is accepted.
+    ///
+    /// Set to `true` (via `setAcceptUnverifiedMessages`) to restore Python LXMF's
+    /// behaviour of accepting unknown-source messages and storing them marked
+    /// unverified. A present but cryptographically invalid signature
+    /// (`.signatureInvalid`) is always rejected regardless of this flag.
+    /// See port-deviations.md.
+    public private(set) var acceptUnverifiedMessages: Bool = false
+
+    /// Configure whether unknown-source (unverified) inbound messages are
+    /// accepted. See `acceptUnverifiedMessages`.
+    public func setAcceptUnverifiedMessages(_ enabled: Bool) {
+        acceptUnverifiedMessages = enabled
+    }
+
     // MARK: - Delegate Wrapper
 
     /// Wrapper for weak delegate reference in actor context.
@@ -543,10 +565,26 @@ public actor LXMRouter {
                 message.method = method
             }
 
-            // Validate signature (silent drop if invalid, per Python behavior)
-            // If source identity is unknown, accept but mark unverified
-            if message.signatureValidated == false && message.unverifiedReason == .signatureInvalid {
+            // A present-but-invalid signature is always a forged or corrupt
+            // message: drop it silently (Python parity).
+            if message.unverifiedReason == .signatureInvalid {
                 routerLogger.warning("REJECTED: invalid signature from \(srcHex)")
+                return false
+            }
+
+            // A message from a source whose identity we cannot recall is
+            // unverifiable: its `sourceHash` is unauthenticated and could be
+            // spoofed. By default we drop it BEFORE `recordDelivered`, so the
+            // message hash is not blacklisted in the dedup set — once the
+            // source's identity announce is recalled (`registerIdentity`) the
+            // sender's retry of the same message verifies and is accepted, making
+            // a `.sourceUnknown` drop transient rather than a permanent loss.
+            // Persisting or delivering it would let a spoofed source forge chat
+            // messages and side-effecting commands. Deviates from Python LXMF,
+            // which accepts unknown-source messages as unverified; opt back in
+            // with `setAcceptUnverifiedMessages(true)`. See port-deviations.md.
+            if message.signatureValidated == false && !acceptUnverifiedMessages {
+                routerLogger.warning("REJECTED: unverified source \(srcHex) (\(String(describing: message.unverifiedReason)))")
                 return false
             }
 

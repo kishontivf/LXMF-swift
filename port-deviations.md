@@ -581,6 +581,43 @@ gate (or if swift's `LXMFDatabase` is reworked so that a duplicate
 hash insert is a true noop / error rather than an overwrite), this
 deviation should be revisited and possibly removed.
 
+### `lxmfDelivery` — reject unverified-source messages by default (security hardening)
+
+**Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,
+the signature-validation block; gated by the `acceptUnverifiedMessages` flag
+(default `false`, set via `setAcceptUnverifiedMessages(_:)`).
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py` — `lxmf_delivery` validates the
+signature when the source identity is recalled and **silently drops** a
+present-but-invalid signature, but **accepts** a message whose source identity
+is unknown, storing it with `signature_validated = False`. The receiving
+application is expected to decide what to do with unverified messages.
+
+**Swift change:** by default the port also drops a message when its signature
+could not be verified because the source identity is not yet recalled
+(`unverifiedReason == .sourceUnknown`), not just when the signature is invalid.
+The drop happens **before** `recordDelivered`, so the message hash is not added
+to the dedup set and the sender's retry is accepted once the source identity is
+recalled (`registerIdentity`, normally from an announce) — i.e. a
+`.sourceUnknown` rejection is transient, not a permanent loss. Python's
+accept-as-unverified behaviour is still reachable via
+`setAcceptUnverifiedMessages(true)` on the router. A `.signatureInvalid` message
+is always dropped, matching python, regardless of the flag.
+
+**Reason:** Category (b) — deliberate behavioural deviation for security. An
+unrecalled source means `sourceHash` is unauthenticated and could be spoofed.
+The LXMF wire format carries only the 16-byte source hash, not the source
+public key, so a message that fails to verify cannot be attributed to its
+claimed sender. Persisting or delivering it would let an attacker forge chat
+messages and side-effecting commands (e.g. an `identityChanged` contact remap)
+that downstream consumers treat as genuine. Dropping pre-persistence keeps the
+"live stream" and "loaded history" views consistent (a message that was never
+trusted enough to deliver is also never resurfaced from the database).
+
+**Re-sync note:** purely additive (a new opt-out flag plus a stricter default);
+no python line moved. If a consumer needs python-faithful semantics, flip
+`acceptUnverifiedMessages`.
+
 ### `saveDeliveredTransientIDs` — off-actor serial write (concurrency adaptation)
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `saveDeliveredTransientIDs`

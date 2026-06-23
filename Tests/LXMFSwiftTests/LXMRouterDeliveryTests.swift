@@ -77,9 +77,9 @@ final class LXMRouterDeliveryTests: XCTestCase {
         let (router, dbPath) = try await makeRouter(identity: routerIdentity)
         let database = try LXMFDatabase(path: dbPath)
 
-        // Cache the source identity so signature validation passes cleanly
-        // (otherwise the message is accepted with unverifiedReason=.sourceUnknown,
-        // which is fine for this test but noisy).
+        // Cache the source identity so signature validation passes. Required:
+        // by default the router rejects messages from an unrecalled source
+        // (unverifiedReason=.sourceUnknown) before persistence.
         await router.registerIdentity(sourceIdentity)
 
         let cases: [(LXDeliveryMethod, String)] = [
@@ -174,5 +174,79 @@ final class LXMRouterDeliveryTests: XCTestCase {
         XCTAssertTrue(reloaded.contains(sentDirectHash), "DIRECT .sent must reload for retry-until-delivered")
         XCTAssertTrue(reloaded.contains(sentOppHash),    "opportunistic .sent must reload for retry-until-delivered")
         XCTAssertFalse(reloaded.contains(sentPropHash),  "PROPAGATED .sent is terminal — must NOT reload (would re-upload)")
+    }
+
+    // MARK: - Unverified-source rejection (security gate)
+
+    /// By default a message from a source whose identity is not recalled is
+    /// rejected before persistence — its `sourceHash` is unauthenticated, so it
+    /// must not be stored or delivered. See port-deviations.md.
+    func testUnverifiedSourceMessageRejectedByDefault() async throws {
+        let routerIdentity = Identity()
+        let sourceIdentity = Identity()
+        let (router, dbPath) = try await makeRouter(identity: routerIdentity)
+        let database = try LXMFDatabase(path: dbPath)
+
+        // Note: source identity intentionally NOT registered.
+        let (packed, hash) = try makePackedMessage(
+            from: sourceIdentity,
+            to: routerIdentity,
+            content: "unverified body"
+        )
+
+        let accepted = await router.lxmfDelivery(packed, method: .direct)
+        XCTAssertFalse(accepted, "Unverified-source message should be rejected")
+        let saved = try await database.getMessage(id: hash)
+        XCTAssertNil(saved, "Rejected message must not be persisted")
+    }
+
+    /// The rejection is transient: it happens before dedup recording, so once
+    /// the source's identity is recalled the sender's retry of the same message
+    /// verifies and is accepted (it is not blacklisted by the first drop).
+    func testUnverifiedSourceAcceptedAfterIdentityRecalled() async throws {
+        let routerIdentity = Identity()
+        let sourceIdentity = Identity()
+        let (router, dbPath) = try await makeRouter(identity: routerIdentity)
+        let database = try LXMFDatabase(path: dbPath)
+
+        let (packed, hash) = try makePackedMessage(
+            from: sourceIdentity,
+            to: routerIdentity,
+            content: "retried body"
+        )
+
+        // First attempt before the announce is recalled: dropped.
+        let firstAccepted = await router.lxmfDelivery(packed, method: .direct)
+        XCTAssertFalse(firstAccepted, "First (pre-announce) attempt should be rejected")
+
+        // Source announce arrives and is recalled; the identical retry verifies.
+        await router.registerIdentity(sourceIdentity)
+        let retryAccepted = await router.lxmfDelivery(packed, method: .direct)
+        XCTAssertTrue(retryAccepted, "Retry after identity recall should be accepted (drop was not blacklisted)")
+
+        let saved = try await database.getMessage(id: hash)
+        XCTAssertNotNil(saved, "Verified retry should be persisted")
+    }
+
+    /// Setting `acceptUnverifiedMessages = true` restores Python LXMF behaviour:
+    /// unknown-source messages are accepted and stored marked unverified.
+    func testAcceptUnverifiedMessagesOptIn() async throws {
+        let routerIdentity = Identity()
+        let sourceIdentity = Identity()
+        let (router, dbPath) = try await makeRouter(identity: routerIdentity)
+        let database = try LXMFDatabase(path: dbPath)
+
+        await router.setAcceptUnverifiedMessages(true)
+
+        let (packed, hash) = try makePackedMessage(
+            from: sourceIdentity,
+            to: routerIdentity,
+            content: "accepted-unverified body"
+        )
+
+        let accepted = await router.lxmfDelivery(packed, method: .direct)
+        XCTAssertTrue(accepted, "With opt-in, unknown-source message should be accepted")
+        let saved = try await database.getMessage(id: hash)
+        XCTAssertNotNil(saved, "Opted-in unverified message should be persisted")
     }
 }
