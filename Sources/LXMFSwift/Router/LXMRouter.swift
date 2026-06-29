@@ -42,6 +42,12 @@ public actor LXMRouter {
     /// Maximum delivery attempts before moving to failed queue
     public static let MAX_DELIVERY_ATTEMPTS = 8
 
+    /// After this many failed delivery attempts to a still-undelivered peer, demote its path
+    /// to `unresponsive` so the path table can fail over to an alternative interface (e.g. a
+    /// half-dead direct MPC session → a TCP route) when the next announce arrives. Fires once,
+    /// well before MAX_DELIVERY_ATTEMPTS, so the remaining attempts can use the new path.
+    public static let PATH_DEMOTE_ATTEMPTS = 3
+
     /// Maximum delivery attempts without path before requesting path
     public static let MAX_PATHLESS_TRIES = 4
 
@@ -751,6 +757,16 @@ public actor LXMRouter {
 
             // Increment delivery attempts
             pendingOutbound[i].deliveryAttempts += 1
+
+            // Failover assist: once a still-undelivered peer has missed a few attempts, demote
+            // its path to unresponsive. The path table's record() keeps the current entry but
+            // lets a different-interface announce replace it (Path 5), so a dead direct route
+            // (e.g. a half-open MPC session) fails over to an alternative on the next announce.
+            // Fires exactly once at the threshold to avoid thrashing.
+            if pendingOutbound[i].deliveryAttempts == Self.PATH_DEMOTE_ATTEMPTS, let pathTable {
+                await pathTable.markPathUnresponsive(pendingOutbound[i].destinationHash)
+                routerLogger.info("Demoted path to \(destHex) → unresponsive after \(Self.PATH_DEMOTE_ATTEMPTS) attempts (failover assist)")
+            }
 
             // Attempt delivery based on method
             do {
