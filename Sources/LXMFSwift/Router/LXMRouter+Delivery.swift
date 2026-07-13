@@ -229,6 +229,13 @@ extension LXMRouter {
             throw error
         }
 
+        // Dual-dispatch: if the recipient is physically nearby on the carrier (BLE), also send the
+        // SAME packet over it. The normal route above may be a multi-hop TCP path that can't actually
+        // deliver to the peer (e.g. it's on 5G behind carrier NAT); the carrier copy gets it there
+        // directly. The receiver dedups by packet hash, so whichever arrives first wins and the other
+        // is a no-op — no waiting for the delivery-failure demotion to reroute. Best-effort.
+        await transport.sendFallbackCopy(packet: packet)
+
         // Mark as sent
         message.state = .sent
 
