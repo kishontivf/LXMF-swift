@@ -293,6 +293,28 @@ public actor LXMFDatabase {
         }
     }
 
+    /// Count messages in a conversation.
+    ///
+    /// Answered by SQLite from `idx_messages_conversation_timestamp`, whose leading column is
+    /// `conversation_hash` — so this reads the index rather than the rows, and never decodes a
+    /// message's content, attachments or packed envelope. Callers that need only the size of a
+    /// conversation should use this instead of paging `getMessages(forConversation:limit:offset:)`,
+    /// which materialises every blob to arrive at the same number.
+    ///
+    /// Counts every stored message, both directions, including any the caller would filter out of a
+    /// chat view (command envelopes are messages in this table like any other).
+    ///
+    /// - Parameter hash: Conversation destination hash (16 bytes)
+    /// - Returns: Number of stored messages, 0 if the conversation is unknown
+    /// - Throws: DatabaseError
+    public func countMessages(forConversation hash: Data) throws -> Int {
+        try dbPool.read { db in
+            try MessageRecord
+                .filter(Column("conversation_hash") == hash)
+                .fetchCount(db)
+        }
+    }
+
     /// Update message state.
     ///
     /// - Parameters:
