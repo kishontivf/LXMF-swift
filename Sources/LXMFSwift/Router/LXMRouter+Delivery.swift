@@ -382,10 +382,17 @@ extension LXMRouter {
             let outboundHandler = LXMFOutboundResourceHandler(router: self)
             await link.setResourceCallbacks(outboundHandler)
 
+            let resourceStarted = ContinuousClock.now
             let resource = try await link.sendResource(data: packed, requestId: nil, isResponse: false)
             let numParts = await resource.numParts
             let resHash = await resource.hash
             let resHashHex = resHash?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+            logResource(destination: message.destinationHash,
+                        hash: resHash,
+                        parts: numParts,
+                        size: packed.count,
+                        phase: "ADVERTISED",
+                        started: resourceStarted)
             directSendLogger.info("Resource created: hash=\(resHashHex), parts=\(numParts), advertisement sent")
 
             // Register resource hash → message hash for delivery confirmation
@@ -535,9 +542,14 @@ extension LXMRouter {
         // Wait for link to become active (with timeout)
         // Link will transition: pending -> handshake -> active
         // when PROOF packet is received
+        let linkWaitStarted = ContinuousClock.now
         do {
             try await waitForLinkActive(link, timeout: LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
+            logLinkEstablishment(destination: destinationHash, started: linkWaitStarted, outcome: "ACTIVE")
         } catch {
+            logLinkEstablishment(destination: destinationHash,
+                                 started: linkWaitStarted,
+                                 outcome: "TIMEOUT/FAILED (\(error.localizedDescription))")
             // Clean up stale pending link from transport to prevent accumulation.
             // Without this, each failed attempt leaves a stale entry in pendingLinks,
             // causing link establishment delay (each retry creates a new link_id but
