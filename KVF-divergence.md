@@ -14,22 +14,25 @@ Scope note: this file tracks *fork vs. upstream*. `port-deviations.md` tracks
 themselves a divergence and are listed under [D3](#d3) below.
 
 - **Upstream base:** `6018671` (`Merge pull request #11 … fix/issue-10-direct-early-close`)
-- **Fork HEAD at last update:** `e719af4` (Version bump)
+- **Fork HEAD at last update:** `457eb4e` (Deep messaging test fixes)
 - **Upstream commits not in this fork:** none — the fork is strictly ahead.
-- **Last reviewed:** 2026-08-02 — see [Status at generation](#status) for the measured
+- **Last reviewed:** 2026-08-19 — see [Status at generation](#status) for the measured
   upstream age, commit counts, and unmerged upstream branches.
 
 ## Summary
 
 | ID | Area | Change | Commits | Depends on |
 |----|------|--------|---------|------------|
-| [D1](#d1) | Package.swift | Depend on the `kishontivf` reticulum-swift fork (≥ 0.4.1); pin SWCompression exactly to 4.8.7 | `ce27afc`, `7e4f0d8`, `9c28e09`, `8e0cd70`, `e26f9c6`, `e719af4` | — |
+| [D1](#d1) | Package.swift | Depend on the `kishontivf` reticulum-swift fork (≥ 0.4.3); cap SWCompression below 4.9.0 | `ce27afc`, `7e4f0d8`, `9c28e09`, `8e0cd70`, `e26f9c6`, `e719af4`, `ed7ee1d`, `457eb4e` | — |
 | [D2](#d2) | MessagePack | Depth cap + bounded `reserveCapacity` in the decoder | `1e740b1` | — |
 | [D3](#d3) | Router (inbound) | Reject unverified-source messages by default (`acceptUnverifiedMessages`) | `69e48e3` | — |
 | [D4](#d4) | Router (outbound) | `PATH_DEMOTE_ATTEMPTS` failover assist | `fbd8a74` | D1 |
 | [D5](#d5) | Router (outbound) | Dual-dispatch carrier copy on opportunistic send | `e26f9c6` | D1 |
 | [D6](#d6) | Storage | `exportDatabase` / `importDatabase` | `ce27afc` | — |
 | [D7](#d7) | Repo hygiene | `.gitignore` additions | `facae56` | — |
+| [D8](#d8) | Diagnostics | Outbound-queue / link / resource / proof markers into ReticulumSwift's `NetworkLog` | `457eb4e` | D1 |
+| [D9](#d9) | Router (outbound) | Pathless retry: attempt refund, exponential backoff, unproven-route invalidation | `457eb4e` | D1, D4 |
+| [D10](#d10) | Storage | `countMessages(forConversation:)` conversation counter | `ed7ee1d` | — |
 
 ### Commit ledger
 
@@ -49,6 +52,9 @@ carry no changes of their own and are omitted.
 | `8e0cd70` | 2026-07-09 | Version bump | [D1](#d1) (0.3.0) |
 | `e26f9c6` | 2026-07-13 | Dual dispatch | [D5](#d5), [D1](#d1) (0.4.0) |
 | `e719af4` | 2026-07-14 | Version bump | [D1](#d1) (0.4.1) |
+| `20d3ede` | 2026-08-02 | Divergence collection | This document; no source change |
+| `ed7ee1d` | 2026-08-18 | Add the ability to count the messages for a given conversation | [D10](#d10), [D1](#d1) (reticulum 0.4.2) |
+| `457eb4e` | 2026-08-19 | Deep messaging test fixes | [D8](#d8), [D9](#d9), [D1](#d1) (reticulum 0.4.3, SWCompression re-widened) |
 
 The D-sections below cover **logic/behaviour** divergence. Anything that changes the
 *shape* of the data — DB schema or domain model — is tracked separately in
@@ -114,17 +120,19 @@ the point is to be able to reconstruct what our stored data looks like at any co
 
 **Commits:** `ce27afc` (repoint to the fork at 0.1.1 + SWCompression exact pin), then the
 reticulum floor bumps `7e4f0d8` (0.1.2), `9c28e09` (0.2.0), `8e0cd70` (0.3.0),
-`e26f9c6` (0.4.0), `e719af4` (0.4.1)
+`e26f9c6` (0.4.0), `e719af4` (0.4.1), `ed7ee1d` (0.4.2), `457eb4e` (0.4.3 + SWCompression
+back to a range)
 
 **Files:** `Package.swift`
 
 - `reticulum-swift` now resolves to `https://github.com/kishontivf/reticulum-swift.git`,
-  `from: "0.4.1"` (upstream: `torlando-tech/reticulum-swift`, `from: "0.3.0"`).
+  `from: "0.4.3"` (upstream: `torlando-tech/reticulum-swift`, `from: "0.3.0"`).
 - A commented-out `.package(path: "../reticulum-swift")` line is kept for local development.
-- SWCompression moved from the range `"4.8.0" ..< "4.9.0"` to `exact: "4.8.7"`. Rationale
-  is unchanged from upstream (4.9.0 raises the floor to macOS 14 / iOS 17, above this
-  library's macOS 13 / iOS 16 floor); the fork just removes the resolver's freedom to pick
-  another 4.8.x.
+- SWCompression went to `exact: "4.8.7"` in `ce27afc` and back to the `"4.8.0" ..< "4.9.0"`
+  range in `457eb4e`, so on this axis the fork is now identical to upstream. The cap itself
+  is upstream's and its rationale is unchanged (4.9.0 raises the floor to macOS 14 / iOS 17,
+  above this library's macOS 13 / iOS 16 floor); only the freedom to pick another 4.8.x came
+  back.
 
 **Why it matters:** D4 and D5 call APIs that exist only in the forked reticulum-swift
 (`PathTable.markPathUnresponsive`, `ReticulumTransport.sendFallbackCopy`), so the two forks
@@ -249,6 +257,94 @@ ignored — `LXMFSwift.xcodeproj`, `Derived/` and `Package.resolved` are untrack
 
 ---
 
+## D8 — Outbound-queue diagnostics {#d8}
+
+**Commits:** `457eb4e`
+
+**Files:** `Sources/LXMFSwift/Router/LXMRouter+NetworkDiagnostics.swift` (new, 153 lines),
+call sites in `LXMRouter.swift` and `LXMRouter+Delivery.swift`, plus two stored properties
+on `LXMRouter` (`lastQueueSummary`, `lastQueueSummaryAt`)
+
+Routes the outbound queue's behaviour into ReticulumSwift's `NetworkLog` — the shared
+`<device>-network.log` the on-device test fleet collects. Markers: `[QUEUE]` (census,
+enqueue, dequeue, slow attempt, pass duration, no-path, route-exhausted), `[LINK]`
+(establishment outcome + duration), `[RES]` (resource lifecycle + throughput), `[PROOF]`
+(delivery proof with end-to-end age).
+
+**Why it exists:** the rest of LXMFSwift logs through `os.log`, which never reaches the
+on-device log files the automated tests collect — so the outbound queue, the component most
+implicated in every "messaging is unreliable" report, was the one part of the send path
+nobody could see after the fact.
+
+**Cost when disabled:** every emitter opens with `guard NetworkLog.isEnabled else { return }`,
+so the census walk and all hex/byte/rate formatting are skipped; the eight inline
+`NetworkLog.debug(…)` sites rely on that function's `@autoclosure`, so no string is built.
+The log is off unless the process sets `RETICULUM_NETWORK_LOG` (reticulum-swift `a7909a0`) —
+one flag governs the diagnostics in both forks. **Residual cost:** `LXMRouter.swift:793`
+builds an 8-byte hex string per queued message per pass, before `shouldAttemptDelivery` and
+outside any guard. Same pattern at `:784`, `:1153`, `:1162`, `:1412`, `:1489`, `:1553`,
+`:1979`, but those sit on already-rare branches.
+
+**Removal:** the file carries a `[TEMPORARY]` header and every helper and call site is
+marked, so `grep -rn '\[TEMPORARY\]'` lists the whole set. Confined to one file plus a
+handful of call sites by design, so it can be dropped wholesale or re-applied after an
+upstream refresh without untangling it from real logic.
+
+## D9 — Pathless retry and unproven-route invalidation {#d9}
+
+**Commits:** `457eb4e`
+
+**Files:** `Sources/LXMFSwift/Router/LXMRouter.swift`
+
+Extends [D4](#d4). Three behaviours in the outbound loop:
+
+1. **Attempt refund.** A message that could not be attempted *because no path existed* no
+   longer spends a delivery attempt (`rescheduleWithoutPath`). `MAX_DELIVERY_ATTEMPTS`
+   counts transmissions that were tried and failed; billing it for "the device had no route"
+   made the 24 h `MAX_OUTBOUND_AGE` unreachable in exactly the case it exists for — a
+   pathless message burned all 8 attempts in ~151 s and was discarded permanently. The
+   2026-08-12 field test lost two messages this way 66 s and 82 s *before* WiFi returned.
+2. **Exponential backoff while pathless.** `retryBackoff(step:)` = `RETRY_BACKOFF_BASE * 2^step`
+   capped at `RETRY_BACKOFF_CAP` — 2 s, 4 s, 8 s … 256 s, then flat at 300 s, tracked per
+   message hash in `pathlessBackoffSteps`. Starting at 2 s is deliberate: most interruptions
+   are brief (a lift, a doorway, a carrier handover) and a fixed floor made recovery slower
+   than the outage. `wakeMessagesWithFreshPath()` clears the step and re-arms a message the
+   moment a path reappears, so the curve never outlives the outage.
+3. **Unproven-route invalidation.** At `PATH_DEMOTE_ATTEMPTS`, and again at
+   `MAX_DELIVERY_ATTEMPTS`, `invalidateUnprovenPath(_:)` removes the path-table entry and
+   requests a fresh one, rate-limited per destination by `PATH_INVALIDATION_COOLDOWN` (30 s).
+   At the second threshold the message is not failed: attempts reset to zero, it is re-queued
+   `UNPROVEN_ROUTE_RETRY_WAIT` (300 s) out and recorded in `awaitingFreshPath`.
+
+**New router state:** `pathlessBackoffSteps`, `awaitingFreshPath`, `lastPathInvalidation`
+(all in-memory, none persisted — a restart loses the backoff curve and every message starts
+due again).
+
+**Tests:** `Tests/LXMFSwiftTests/LXMRouterPathlessRetryTests.swift` (156 lines) and
+`LXMRouterUnprovenRouteTests.swift` (258 lines).
+
+**Merge risk:** this is the highest-conflict divergence in the fork. It inserts branches
+into the middle of `processOutbound`, the loop upstream actively maintains, and it now owns
+the meaning of `deliveryAttempts` — any upstream change to attempt accounting will collide
+here rather than merge.
+
+## D10 — Conversation message count {#d10}
+
+**Commits:** `ed7ee1d`
+
+**Files:** `Sources/LXMFSwift/Storage/LXMFDatabase.swift`
+
+`public func countMessages(forConversation hash: Data) throws -> Int`. Answered from
+`idx_messages_conversation_timestamp`, whose leading column is `conversation_hash`, so it
+reads the index rather than the rows and never decodes content, attachments or the packed
+envelope — the alternative was `getMessages(forConversation:limit:offset:)`, which
+materialises every blob to arrive at the same number.
+
+Additive public API on the database type; registers no migration and changes no table — see
+[Schema & domain changes](#schema).
+
+---
+
 ## Re-sync checklist
 
 When pulling new upstream work:
@@ -256,10 +352,14 @@ When pulling new upstream work:
 1. `git fetch upstream && git log --oneline HEAD..upstream/main`
 2. Re-sync `kishontivf/reticulum-swift` first if upstream moved its reticulum floor ([D1](#d1)).
 3. Conflict-prone files, in order of likelihood:
-   `Sources/LXMFSwift/Router/LXMRouter.swift` (D3, D4),
-   `Sources/LXMFSwift/Router/LXMRouter+Delivery.swift` (D5),
-   `Sources/LXMFSwift/Storage/LXMFDatabase.swift` (D6),
+   `Sources/LXMFSwift/Router/LXMRouter.swift` (D3, D4, **D9**, D8 call sites),
+   `Sources/LXMFSwift/Router/LXMRouter+Delivery.swift` (D5, D8 call sites),
+   `Sources/LXMFSwift/Storage/LXMFDatabase.swift` (D6, D10),
    `port-deviations.md` (D3), `Package.swift` (D1).
+   `LXMRouter+NetworkDiagnostics.swift` (D8) is a new file and cannot conflict; it is listed
+   here only because its call sites live in the two files above.
+   **Start with [D9](#d9)** — it rewrites the middle of `processOutbound` and redefines what
+   `deliveryAttempts` counts, so an upstream change to attempt accounting lands there first.
 4. Diff the migration list in `LXMFDatabase.makeMigrator()` against
    [Schema & domain changes](#schema). Upstream numbering ours by collision (two different
    `v7`s) is the failure mode to look for — resolve by renaming ours to a later
@@ -273,18 +373,19 @@ When pulling new upstream work:
 
 ## Status at generation {#status}
 
-**Generated:** 2026-08-02 (all figures below measured on that date, against
-`upstream` = `git@github.com:torlando-tech/LXMF-swift.git` after `git fetch upstream`).
+**Generated:** 2026-08-02, **updated 2026-08-19** (all figures below measured on the update
+date, against `upstream` = `git@github.com:torlando-tech/LXMF-swift.git` after
+`git fetch upstream`).
 
 | Metric | Value |
 |--------|-------|
-| Fork HEAD | `e719af4` — 2026-07-14 (19 days old) |
-| Upstream base we sit on | `6018671` — 2026-06-20 (**43 days old**) |
+| Fork HEAD | `457eb4e` — 2026-08-19 |
+| Upstream base we sit on | `6018671` — 2026-06-20 (**60 days old**) |
 | Upstream `main` tip | `6018671` — identical to our base |
 | Upstream commits we are missing | **0** — `upstream/main` has not moved since we branched |
-| Our commits ahead of upstream | **12** (10 content commits + 2 PR merges) |
+| Our commits ahead of upstream | **15** (13 content commits + 2 PR merges) |
 
-So the fork is strictly ahead: nothing to pull, 12 commits to carry. The "43 days old"
+So the fork is strictly ahead: nothing to pull, 15 commits to carry. The "60 days old"
 figure is the age of upstream's newest work, not a backlog — upstream `main` itself has
 been idle since 2026-06-20.
 
@@ -308,6 +409,7 @@ HEAD the file described at that point.
 
 | Date | Covers | Change |
 |------|--------|--------|
+| 2026-08-19 | `457eb4e` | Added [D8](#d8) (queue diagnostics), [D9](#d9) (pathless retry / unproven-route invalidation) and [D10](#d10) (message count). Corrected [D1](#d1): reticulum floor is 0.4.3 and the SWCompression pin went back to upstream's range. Refreshed the ledger, re-sync checklist and status. |
 | 2026-08-02 | `e719af4` | Added [Status at generation](#status) and this changelog. |
 | 2026-08-02 | `e719af4` | Added commit IDs: `Commits` column in the summary table, the [commit ledger](#summary), per-section `**Commits:**` lines on D1–D7, and a `Commit` column in the schema ledger. |
 | 2026-08-02 | `e719af4` | Initial version — D1–D7, [Schema & domain changes](#schema), re-sync checklist. |

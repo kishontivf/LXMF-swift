@@ -39,8 +39,29 @@ public actor LXMRouter {
 
     // MARK: - Constants
 
-    /// Maximum delivery attempts before moving to failed queue
+    /// Unproven sends allowed over ONE route before that route is thrown away and the budget
+    /// resets. No longer the point at which a message is abandoned — see the
+    /// `deliveryAttempts >= MAX_DELIVERY_ATTEMPTS` branch in `processOutbound`, where
+    /// `MAX_OUTBOUND_AGE` is now the only terminal bound.
     public static let MAX_DELIVERY_ATTEMPTS = 8
+
+    /// Minimum gap between clearing the same destination's path. Long enough that a re-learned
+    /// route gets a real chance to prove itself, short enough that a genuinely dead route is
+    /// re-cleared promptly once the cooldown lapses.
+    public static let PATH_INVALIDATION_COOLDOWN: TimeInterval = 30
+
+    /// First retry delay, doubled on each successive failure by `retryBackoff(step:)`.
+    public static let RETRY_BACKOFF_BASE: TimeInterval = 2
+
+    /// Ceiling for the exponential retry backoff. Also the pause after a whole route is written
+    /// off, so a dead contact settles at one attempt per five minutes.
+    public static let RETRY_BACKOFF_CAP: TimeInterval = 300
+
+    /// Pause after a route absorbs a full attempt budget without proof. Long enough that a dead
+    /// contact costs almost nothing (a `.direct` retry can block the pass for up to
+    /// LINK_ESTABLISHMENT_TIMEOUT, so these must stay rare), short enough that a peer which comes
+    /// back into range is picked up within minutes rather than hours.
+    public static let UNPROVEN_ROUTE_RETRY_WAIT: TimeInterval = 300
 
     /// After this many failed delivery attempts to a still-undelivered peer, demote its path
     /// to `unresponsive` so the path table can fail over to an alternative interface (e.g. a
@@ -128,6 +149,27 @@ public actor LXMRouter {
 
     /// Reentrancy guard for processOutbound
     public var processingOutbound: Bool = false
+
+    /// Consecutive no-path reschedules per message hash, driving the exponential backoff in
+    /// `rescheduleWithoutPath`. Held beside the queue rather than as a field on `LXMessage`
+    /// because that struct is persisted — a new field would change the stored format for a
+    /// value that is meaningless across a restart anyway. Pruned to the queue each pass.
+    private var pathlessBackoffSteps: [Data: Int] = [:]
+
+    /// Hashes of messages parked after their route was written off, waiting out
+    /// `UNPROVEN_ROUTE_RETRY_WAIT`. Released early by `wakeMessagesWithFreshPath` once a usable
+    /// path exists. Pruned to the live queue on every pass.
+    private var awaitingFreshPath: Set<Data> = []
+
+    /// When each destination's path was last cleared by `invalidateUnprovenPath`, so the clear →
+    /// stale-relearn → clear loop is damped. Bounded by contact count, not queue depth.
+    private var lastPathInvalidation: [Data: Date] = [:]
+
+    /// [TEMPORARY] Last `[QUEUE]` summary emitted, and when — so the 1s processing loop logs on CHANGE
+    /// rather than on every tick. A steady queue that is genuinely stuck still gets a
+    /// heartbeat via `queueSummaryHeartbeat`. See `LXMRouter+NetworkDiagnostics.swift`.
+    var lastQueueSummary: String = ""
+    var lastQueueSummaryAt: ContinuousClock.Instant = .now
 
     /// Flag to stop the processing loop (for shutdown)
     private var isShutdown: Bool = false
@@ -465,6 +507,8 @@ public actor LXMRouter {
 
         // Add to pending outbound queue
         pendingOutbound.append(message)
+        // [TEMPORARY]
+        logEnqueue(message)
 
         // Persist to database before processing so the message survives force-quit
         do {
@@ -676,6 +720,12 @@ public actor LXMRouter {
         processingOutbound = true
         defer { processingOutbound = false }
 
+        // [TEMPORARY]
+        await wakeMessagesWithFreshPath()
+
+        logQueueCensus()
+        let passStarted = ContinuousClock.now
+
         // Track indices to remove (use index-based access so struct mutations persist)
         var indicesToRemove: IndexSet = []
 
@@ -683,12 +733,16 @@ public actor LXMRouter {
             // Check if message already delivered
             if pendingOutbound[i].state == .delivered {
                 indicesToRemove.insert(i)
+                // [TEMPORARY]
+                logDequeue(pendingOutbound[i], reason: "delivered")
                 continue
             }
 
             // Check if message cancelled
             if pendingOutbound[i].state == .cancelled {
                 indicesToRemove.insert(i)
+                // [TEMPORARY]
+                logDequeue(pendingOutbound[i], reason: "cancelled")
                 notifyFailure(pendingOutbound[i], reason: .invalidStateTransition(from: .outbound, to: .cancelled))
                 continue
             }
@@ -712,6 +766,8 @@ public actor LXMRouter {
             // resource REJECTED — that `processOutbound` does not).
             if pendingOutbound[i].state == .rejected {
                 indicesToRemove.insert(i)
+                // [TEMPORARY]
+                logDequeue(pendingOutbound[i], reason: "rejected")
                 continue
             }
 
@@ -727,24 +783,9 @@ public actor LXMRouter {
                 }
                 let destHex = expiredMsg.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                 routerLogger.warning("Message expired (age=\(Int(messageAge))s): dest=\(destHex)")
+                // [TEMPORARY]
+                logDequeue(expiredMsg, reason: "expired(MAX_OUTBOUND_AGE)")
                 notifyFailure(expiredMsg, reason: .maxAttemptsExceeded)
-                continue
-            }
-
-            // Check if max delivery attempts exceeded
-            if pendingOutbound[i].deliveryAttempts >= Self.MAX_DELIVERY_ATTEMPTS {
-                pendingOutbound[i].state = .failed
-                let failedMsg = pendingOutbound[i]
-                indicesToRemove.insert(i)
-                failedOutbound.append(failedMsg)
-
-                // Update database
-                Task.detached { [database] in
-                    try? await database.updateMessageState(id: failedMsg.hash, state: .failed)
-                }
-
-                // Notify delegate
-                notifyFailure(failedMsg, reason: .maxAttemptsExceeded)
                 continue
             }
 
@@ -755,17 +796,70 @@ public actor LXMRouter {
                 continue
             }
 
+            // Delivery-attempt budget spent. This is NOT terminal: `MAX_OUTBOUND_AGE` (24h) is the
+            // only bound on how long we keep trying, which is what that constant has always
+            // claimed. Eight unproven sends means the ROUTE isn't delivering, not that the message
+            // is undeliverable — the 2026-08-12 field test discarded 21 messages this way in
+            // 71-87s, to a peer that was merely out of BLE range behind a stale 4-hop relay path.
+            //
+            // So: throw the path away so a different carrier can win it back, reset the budget for
+            // that new route, and back off hard. Safe to clear the only known path because a
+            // pathless queue entry now costs nothing (see `rescheduleWithoutPath`) and
+            // `requestPath` re-learns it.
+            if pendingOutbound[i].deliveryAttempts >= Self.MAX_DELIVERY_ATTEMPTS {
+                await invalidateUnprovenPath(pendingOutbound[i].destinationHash)
+                pendingOutbound[i].deliveryAttempts = 0
+                // Whatever replaces this route deserves a clean slate: start its backoff at
+                // RETRY_BACKOFF_BASE again rather than inheriting the dead route's history.
+                pathlessBackoffSteps[pendingOutbound[i].hash] = 0
+                // Back to `.outbound` so the next round actually re-sends: an opportunistic entry
+                // sits at `.sent` while awaiting a proof that is never coming.
+                pendingOutbound[i].state = .outbound
+                pendingOutbound[i].nextDeliveryAttempt =
+                    Date().addingTimeInterval(Self.UNPROVEN_ROUTE_RETRY_WAIT)
+                // The park is a ceiling, not a sentence: `wakeMessagesWithFreshPath` releases it
+                // the moment a usable path appears, so a peer that comes back into range is not
+                // left waiting out a timer that has already been overtaken by events.
+                awaitingFreshPath.insert(pendingOutbound[i].hash)
+                // [TEMPORARY]
+                NetworkLog.debug("[QUEUE] ROUTE-EXHAUSTED dest=\(destHex) — \(Self.MAX_DELIVERY_ATTEMPTS) "
+                    + "unproven sends, path cleared, retrying in \(Int(Self.UNPROVEN_ROUTE_RETRY_WAIT))s "
+                    + "(age=\(Int(Date().timeIntervalSince1970 - pendingOutbound[i].timestamp))s)")
+                continue
+            }
+
             // Increment delivery attempts
             pendingOutbound[i].deliveryAttempts += 1
 
-            // Failover assist: once a still-undelivered peer has missed a few attempts, demote
-            // its path to unresponsive. The path table's record() keeps the current entry but
-            // lets a different-interface announce replace it (Path 5), so a dead direct route
-            // (e.g. a half-open MPC session) fails over to an alternative on the next announce.
-            // Fires exactly once at the threshold to avoid thrashing.
-            if pendingOutbound[i].deliveryAttempts == Self.PATH_DEMOTE_ATTEMPTS, let pathTable {
-                await pathTable.markPathUnresponsive(pendingOutbound[i].destinationHash)
-                routerLogger.info("Demoted path to \(destHex) → unresponsive after \(Self.PATH_DEMOTE_ATTEMPTS) attempts (failover assist)")
+            // Failover assist: a few unproven sends in a row means this ROUTE is dead, and that
+            // verdict should take seconds — it is independent of how long we keep the MESSAGE.
+            //
+            // This used to call `markPathUnresponsive`, which keeps the entry: a transport node
+            // still re-announcing the stale route simply re-asserts it, so every retry went back
+            // into the same hole (Session04). Waiting for the full attempt budget instead was
+            // worse — Session05 measured 354s of replies fired into an `icWifi0` path belonging
+            // to a LAN the peer had already left, while a working route sat unused. Clearing the
+            // entry here lets the next announce win the path on merit, within ~15s.
+            if pendingOutbound[i].deliveryAttempts == Self.PATH_DEMOTE_ATTEMPTS,
+               await invalidateUnprovenPath(pendingOutbound[i].destinationHash) {
+                // [TEMPORARY]
+                NetworkLog.debug("[QUEUE] ROUTE-DEAD dest=\(destHex) — \(Self.PATH_DEMOTE_ATTEMPTS) "
+                    + "unproven sends, path cleared early")
+            }
+
+            // [TEMPORARY] Time this entry's whole attempt. Registered as a `defer` so the throwing paths
+            // are measured too — a delivery that fails slowly is exactly as starving to the
+            // messages behind it as one that succeeds slowly.
+            let attemptStarted = ContinuousClock.now
+            let attemptMethod = pendingOutbound[i].method
+            let attemptDestination = pendingOutbound[i].destinationHash
+            defer {
+                if ContinuousClock.now - attemptStarted >= Self.slowAttemptThreshold {
+                    logSlowAttempt(method: attemptMethod,
+                                   destination: attemptDestination,
+                                   elapsed: attemptStarted,
+                                   blockedBehind: dueMessagesAfter(index: i))
+                }
             }
 
             // Attempt delivery based on method
@@ -779,10 +873,15 @@ public actor LXMRouter {
                     // Check if we need path and don't have one
                     let hasPathForOpp = await hasPath(pendingOutbound[i].destinationHash)
 
-                    if pendingOutbound[i].deliveryAttempts >= Self.MAX_PATHLESS_TRIES, !hasPathForOpp {
-                        // Request path and wait
+                    // No path, and not one of our own delivery destinations (self-send, which
+                    // resolves its key locally) → sending is IMPOSSIBLE, not merely likely to fail:
+                    // `sendOpportunistic` reads the recipient's public key out of the path entry, so
+                    // a "blind" attempt can only throw `.noPath`. The old gate spent
+                    // MAX_PATHLESS_TRIES attempts discovering that every time. Request a path and
+                    // wait WITHOUT consuming the delivery budget — see `rescheduleWithoutPath`.
+                    if !hasPathForOpp, deliveryDestinations[pendingOutbound[i].destinationHash] == nil {
                         requestPath(pendingOutbound[i].destinationHash)
-                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+                        rescheduleWithoutPath(i)
                     } else {
                         // Attempt send (copy out for inout async call, then write back)
                         routerLogger.debug("Calling sendOpportunistic for \(destHashHex)")
@@ -896,10 +995,10 @@ public actor LXMRouter {
                             }
                         }
                     } else {
-                        // Need path first
+                        // Need path first — nothing was transmitted, so don't bill the attempt.
                         routerLogger.warning("No path to \(destHashHex), requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
-                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+                        rescheduleWithoutPath(i)
                     }
 
                 case .propagated:
@@ -1035,27 +1134,57 @@ public actor LXMRouter {
                             try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
                         }
                     } else {
+                        // No path to the propagation node — same reasoning as the other two branches.
                         requestPath(nodeHash)
-                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+                        rescheduleWithoutPath(i)
                     }
 
                 default:
                     // Unknown method, skip
                     break
                 }
+            } catch LXMFError.noPath {
+                // The send never reached the wire — a path vanished between the check above and the
+                // send itself (routine while a radio is going down). Identical accounting to the
+                // pathless branches: request a path, reschedule, don't bill the attempt.
+                requestPath(pendingOutbound[i].destinationHash)
+                rescheduleWithoutPath(i)
+                // [TEMPORARY] — the log only. The catch arm above is the permanent fix.
+                let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                NetworkLog.debug("[QUEUE] NO-PATH dest=\(destHex) — path requested, attempt not billed "
+                    + "(attempts=\(pendingOutbound[i].deliveryAttempts)/\(Self.MAX_DELIVERY_ATTEMPTS))")
             } catch {
-                // Delivery failed, will retry on next cycle
-                // Schedule retry with exponential backoff
-                let backoffSeconds = min(Double(pendingOutbound[i].deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
+                // Delivery failed, will retry on next cycle. Exponential rather than the old
+                // linear `attempts * PATH_REQUEST_WAIT`, which took a fixed 15s to retry even a
+                // one-second glitch while still reaching the cap after only a handful of tries.
+                let backoffSeconds = Self.retryBackoff(step: pendingOutbound[i].deliveryAttempts - 1)
                 pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(backoffSeconds)
                 let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                // [TEMPORARY]
+                NetworkLog.debug("[QUEUE] ATTEMPT-FAIL \(pendingOutbound[i].method) dest=\(destHex) "
+                    + "attempt=\(pendingOutbound[i].deliveryAttempts)/\(Self.MAX_DELIVERY_ATTEMPTS) "
+                    + "backoff=\(Int(backoffSeconds))s: \(error.localizedDescription)")
                 routerLogger.error("Delivery failed for \(destHex): \(error.localizedDescription), retrying in \(backoffSeconds)s")
             }
+        }
+
+        // [TEMPORARY] A pass that outruns the processing interval means the self-rescheduling loop is no
+        // longer running at its nominal cadence — every message in the queue is now waiting on
+        // whatever made this pass long, not on the network.
+        if ContinuousClock.now - passStarted >= Self.slowAttemptThreshold {
+            NetworkLog.debug("[QUEUE] pass took \(NetworkLog.ms(since: passStarted)) "
+                + "(interval is \(Self.PROCESSING_INTERVAL)s) — \(queueCensus())")
         }
 
         // Remove sent/completed messages from pending (reverse order to preserve indices)
         for i in indicesToRemove.sorted().reversed() {
             pendingOutbound.remove(at: i)
+        }
+
+        // Drop backoff state for anything no longer queued, so the map can't outlive the queue.
+        if !pathlessBackoffSteps.isEmpty {
+            let live = Set(pendingOutbound.map(\.hash))
+            pathlessBackoffSteps = pathlessBackoffSteps.filter { live.contains($0.key) }
         }
 
         // Persist state changes
@@ -1244,6 +1373,16 @@ public actor LXMRouter {
         // (LXMRouter.py:2516-2519). No-op when the entry was already removed (e.g. DIRECT).
         if let idx = pendingOutbound.firstIndex(where: { $0.hash == messageHash }) {
             pendingOutbound[idx].state = .delivered
+            // [TEMPORARY] End-to-end age, not time-since-last-send: for this field test the question is
+            // "how long did the user wait", which spans every retry and coverage gap.
+            let age = Int(Date().timeIntervalSince1970 - pendingOutbound[idx].timestamp)
+            logProof(messageHash: messageHash,
+                     method: "\(pendingOutbound[idx].method) age=\(age)s attempts=\(pendingOutbound[idx].deliveryAttempts)")
+        } else {
+            // [TEMPORARY] Already dequeued (the DIRECT/propagated resource paths remove on send), so the
+            // queue can't supply age — still worth a line, since this is the delivery evidence.
+            // [TEMPORARY]
+            logProof(messageHash: messageHash, method: "dequeued-before-proof")
         }
 
         // Notify delegate for UI refresh
@@ -1354,6 +1493,9 @@ public actor LXMRouter {
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
+        // [TEMPORARY]
+        NetworkLog.debug("[RES] COMPLETE res=\(resHex) → msg=\(msgHex)")
+
         if pendingPropagationResources.remove(resourceHash) != nil {
             // PROPAGATED resource transfer — python `__mark_propagated`.
             routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking sent (propagation node ack)")
@@ -1415,6 +1557,11 @@ public actor LXMRouter {
             return
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+        // [TEMPORARY] The image-send failure line. A resource that concludes non-complete is the most
+        // likely way a picture "just doesn't arrive" while text on the same link works.
+        NetworkLog.debug("[RES] FAILED res=\(resHex) → msg=\(msgHex) "
+            + "state=\(resourceState) path=\(wasPropagation ? "propagated" : "direct")")
 
         // Drain `pendingPropagationSends` here too — the resource path
         // pushed this hash in `sendPropagated` before sendResource and
@@ -1754,6 +1901,124 @@ public actor LXMRouter {
     /// Check if delivery should be attempted for message.
     ///
     /// - Parameter message: Message to check
+    /// Release messages parked by `ROUTE-EXHAUSTED` as soon as a usable path exists for them.
+    ///
+    /// Without this the park is a fixed `UNPROVEN_ROUTE_RETRY_WAIT`, which in the field meant a
+    /// message sat on a 5-minute timer while a perfectly good route was already available — the
+    /// replies that finally arrived "much later, over WebRTC and BLE" in Session05. The park
+    /// exists to stop us hammering a destination we cannot reach, so it should end the instant
+    /// that stops being true.
+    ///
+    /// Applies to anything waiting *because it had nowhere to send* — whether parked by
+    /// ROUTE-EXHAUSTED or merely climbing the pathless backoff curve. Restricting it to parked
+    /// messages was too narrow: in Session06 a message served out ~105s of accumulated backoff
+    /// after connectivity had already returned, because it had never been parked at all.
+    ///
+    /// Costs one path lookup per distinct stuck destination per pass — nothing when the queue is
+    /// healthy, since no entry is waiting on a path.
+    private func wakeMessagesWithFreshPath() async {
+        func isWaitingOnAPath(_ message: LXMessage) -> Bool {
+            awaitingFreshPath.contains(message.hash) || (pathlessBackoffSteps[message.hash] ?? 0) > 0
+        }
+        guard pendingOutbound.contains(where: isWaitingOnAPath) else { return }
+
+        var reachable: Set<Data> = []
+        var checked: Set<Data> = []
+        for message in pendingOutbound where isWaitingOnAPath(message) {
+            let destination = message.destinationHash
+            guard checked.insert(destination).inserted else { continue }
+            if await hasPath(destination) { reachable.insert(destination) }
+        }
+
+        for i in pendingOutbound.indices
+        where isWaitingOnAPath(pendingOutbound[i])
+            && reachable.contains(pendingOutbound[i].destinationHash) {
+            let hash = pendingOutbound[i].hash
+            awaitingFreshPath.remove(hash)
+            // Reset the curve as well: the outage is over, so a later failure should start again
+            // at RETRY_BACKOFF_BASE rather than resuming a climb that belonged to the outage.
+            pathlessBackoffSteps[hash] = 0
+            pendingOutbound[i].nextDeliveryAttempt = Date()
+            // [TEMPORARY]
+            NetworkLog.debug("[QUEUE] PATH-BACK dest=\(NetworkLog.hex8(pendingOutbound[i].destinationHash)) "
+                + "— released early, path available again")
+        }
+
+        // Drop entries for messages that have since left the queue.
+        let live = Set(pendingOutbound.map(\.hash))
+        awaitingFreshPath = awaitingFreshPath.intersection(live)
+    }
+
+    /// Drop the current path to `destinationHash` and ask for a fresh one, after a route has
+    /// absorbed a full delivery-attempt budget without ever returning a proof.
+    ///
+    /// `markPathUnresponsive` (the lighter `PATH_DEMOTE_ATTEMPTS` step) proved insufficient in the
+    /// field: it keeps the entry, so a transport node that is still happily re-announcing a
+    /// 4-hop relay route simply re-asserts it, and every retry goes back into the same hole. The
+    /// peer was reachable the whole time over BLE at one hop. Removing the entry outright lets the
+    /// next announce — quite possibly a nearer carrier — win the path on merit.
+    /// Rate-limited per destination: clearing a path makes the next announce re-learn it, and if
+    /// that announce is the same stale route we would clear it again three attempts later. In
+    /// Session06 that loop fired 366 times fleet-wide (260 on one device, 228 aimed at a single
+    /// peer), each cycle also emitting a path request. The cooldown lets a re-learned route
+    /// actually be tried before we write it off again.
+    ///
+    /// - Returns: true if the path was cleared, false if suppressed by the cooldown.
+    /// `internal` rather than `private` so a cross-file extension can reach it — same reason
+    /// `pendingOutbound` is internal. Not part of the public surface.
+    @discardableResult
+    func invalidateUnprovenPath(_ destinationHash: Data) async -> Bool {
+        guard let pathTable else { return false }
+        if let last = lastPathInvalidation[destinationHash],
+           Date().timeIntervalSince(last) < Self.PATH_INVALIDATION_COOLDOWN {
+            return false
+        }
+        lastPathInvalidation[destinationHash] = Date()
+        await pathTable.remove(destinationHash: destinationHash)
+        requestPath(destinationHash)
+        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.info("Cleared unproven path to \(destHex); requested a fresh one")
+        return true
+    }
+
+    /// Reschedule a queue entry that could not be attempted because no path exists, WITHOUT
+    /// consuming its delivery budget.
+    ///
+    /// `MAX_DELIVERY_ATTEMPTS` counts *transmissions* — deliveries that were tried and failed.
+    /// Billing it for "the device had no route" made the 24h `MAX_OUTBOUND_AGE` unreachable in
+    /// precisely the case it exists for: a pathless message burned all 8 attempts in ~151s
+    /// (4 throwing tries, then `PATH_REQUEST_WAIT` apart) and was permanently discarded. The
+    /// 2026-08-12 field test lost two messages this way 66s and 82s BEFORE WiFi returned — the
+    /// device recovered, the messages did not.
+    ///
+    /// Retries back off exponentially (see `retryBackoff`), so a two-second coverage blip is
+    /// recovered in two seconds while a device that has been dark for an hour costs almost
+    /// nothing. `MAX_OUTBOUND_AGE` remains the only terminal bound.
+    private func rescheduleWithoutPath(_ index: Int) {
+        // Undo the unconditional increment at the top of the loop. Same idiom as the
+        // propagation-node-not-configured branch, which has always refunded its attempt.
+        pendingOutbound[index].deliveryAttempts = max(0, pendingOutbound[index].deliveryAttempts - 1)
+
+        let hash = pendingOutbound[index].hash
+        let step = pathlessBackoffSteps[hash] ?? 0
+        pathlessBackoffSteps[hash] = step + 1
+        pendingOutbound[index].nextDeliveryAttempt =
+            Date().addingTimeInterval(Self.retryBackoff(step: step))
+    }
+
+    /// Exponential backoff: `RETRY_BACKOFF_BASE * 2^step`, capped at `RETRY_BACKOFF_CAP`.
+    /// 2s, 4s, 8s, 16s … 256s, then flat at the cap.
+    ///
+    /// Starting at two seconds matters as much as the cap does. Most real interruptions are
+    /// brief — a lift, a doorway, a handover between carriers — and a fixed 15s floor made the
+    /// recovery slower than the outage. The doubling is what keeps that cheap: a peer that is
+    /// genuinely gone reaches the cap after eight tries, so it costs one attempt per five
+    /// minutes rather than one every fifteen seconds.
+    static func retryBackoff(step: Int) -> TimeInterval {
+        let clamped = min(max(step, 0), 16)   // 2^16 already far exceeds the cap; avoids overflow
+        return min(RETRY_BACKOFF_CAP, RETRY_BACKOFF_BASE * TimeInterval(1 << clamped))
+    }
+
     /// - Returns: True if should attempt delivery now
     private func shouldAttemptDelivery(_ message: LXMessage) -> Bool {
         // Check if next attempt time has passed
