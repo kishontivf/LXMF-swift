@@ -103,11 +103,20 @@ extension LXMRouter {
             guard let pathTable = self.pathTable else {
                 throw LXMFError.transportNotAvailable
             }
-            guard let destPathEntry = await pathTable.lookup(destinationHash: Data(destHash)) else {
-                propLogger.error("[PROP_SEND] No path entry for recipient \(destHashHex); LXMessage cannot be encrypted to recipient")
+            if let destPathEntry = await pathTable.lookup(destinationHash: Data(destHash)) {
+                destIdentity = try Identity(publicKeyBytes: destPathEntry.publicKeys)
+            } else if let cached = recallIdentity(Data(destHash)) {
+                // [LOCAL DIVERGENCE from upstream] Python resolves the recipient with
+                // `RNS.Identity.recall()`, which is independent of the path table. A propagated
+                // send exists precisely for a recipient we currently have NO path to; refusing it
+                // for lack of a path entry defeats it. The identity cache holds every announced
+                // identity this process has seen (`registerIdentity`).
+                propLogger.info("[PROP_SEND] No path entry for recipient \(destHashHex); using cached identity")
+                destIdentity = cached
+            } else {
+                propLogger.error("[PROP_SEND] No path entry or cached identity for recipient \(destHashHex); LXMessage cannot be encrypted to recipient")
                 throw LXMFError.noPath
             }
-            destIdentity = try Identity(publicKeyBytes: destPathEntry.publicKeys)
             destIdentityHash = destIdentity.hash
         }
 

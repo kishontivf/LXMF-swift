@@ -21,8 +21,11 @@ let package = Package(
         )
     ],
     dependencies: [
-       .package(url: "https://github.com/kishontivf/reticulum-swift.git", from: "0.4.3"),
-        // .package(path: "../reticulum-swift"),
+        // Local path: the safe-transport-node-e2e work spans reticulum-swift +
+        // LXMF-swift + Intercom-swift together. Restore the pinned remote version
+        // when the branch lands.
+        // .package(url: "https://github.com/kishontivf/reticulum-swift.git", from: "0.4.3"),
+        .package(path: "../reticulum-swift"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
         // Cap below 4.9.0: SWCompression 4.9.0 raised its floor to macOS 14 / iOS 17,
         // above this library's macOS 13 / iOS 16 (which matches the sibling ports
