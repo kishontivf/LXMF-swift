@@ -21,7 +21,7 @@ let package = Package(
         )
     ],
     dependencies: [
-       .package(url: "https://github.com/kishontivf/reticulum-swift.git", from: "0.4.3"),
+        .package(url: "https://github.com/kishontivf/reticulum-swift.git", from: "0.4.4"),
         // .package(path: "../reticulum-swift"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
         // Cap below 4.9.0: SWCompression 4.9.0 raised its floor to macOS 14 / iOS 17,
