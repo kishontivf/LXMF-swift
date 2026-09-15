@@ -23,7 +23,7 @@ themselves a divergence and are listed under [D3](#d3) below.
 
 | ID | Area | Change | Commits | Depends on |
 |----|------|--------|---------|------------|
-| [D1](#d1) | Package.swift | Depend on the `kishontivf` reticulum-swift fork (≥ 0.4.3); cap SWCompression below 4.9.0 | `ce27afc`, `7e4f0d8`, `9c28e09`, `8e0cd70`, `e26f9c6`, `e719af4`, `ed7ee1d`, `457eb4e` | — |
+| [D1](#d1) | Package.swift | Depend on the `kishontivf` reticulum-swift fork (≥ 0.4.3) | `ce27afc`, `7e4f0d8`, `9c28e09`, `8e0cd70`, `e26f9c6`, `e719af4`, `ed7ee1d`, `457eb4e` | — |
 | [D2](#d2) | MessagePack | Depth cap + bounded `reserveCapacity` in the decoder | `1e740b1` | — |
 | [D3](#d3) | Router (inbound) | Reject unverified-source messages by default (`acceptUnverifiedMessages`) | `69e48e3` | — |
 | [D4](#d4) | Router (outbound) | `PATH_DEMOTE_ATTEMPTS` failover assist | `fbd8a74` | D1 |
@@ -33,6 +33,7 @@ themselves a divergence and are listed under [D3](#d3) below.
 | [D8](#d8) | Diagnostics | Outbound-queue / link / resource / proof markers into ReticulumSwift's `NetworkLog` | `457eb4e` | D1 |
 | [D9](#d9) | Router (outbound) | Pathless retry: attempt refund, exponential backoff, unproven-route invalidation | `457eb4e` | D1, D4 |
 | [D10](#d10) | Storage | `countMessages(forConversation:)` conversation counter | `ed7ee1d` | — |
+| [D11](#d11) | Package.swift, Storage | GRDB 7 + SWCompression 4.9; platform floor macOS 14 / iOS 17 | _uncommitted_ | — |
 
 ### Commit ledger
 
@@ -55,6 +56,7 @@ carry no changes of their own and are omitted.
 | `20d3ede` | 2026-08-02 | Divergence collection | This document; no source change |
 | `ed7ee1d` | 2026-08-18 | Add the ability to count the messages for a given conversation | [D10](#d10), [D1](#d1) (reticulum 0.4.2) |
 | `457eb4e` | 2026-08-19 | Deep messaging test fixes | [D8](#d8), [D9](#d9), [D1](#d1) (reticulum 0.4.3, SWCompression re-widened) |
+| _uncommitted_ | 2026-09-15 | GRDB 7 / SWCompression 4.9 bump, export/import tests | [D11](#d11), [D6](#d6) (tests) |
 
 The D-sections below cover **logic/behaviour** divergence. Anything that changes the
 *shape* of the data — DB schema or domain model — is tracked separately in
@@ -128,11 +130,8 @@ back to a range)
 - `reticulum-swift` now resolves to `https://github.com/kishontivf/reticulum-swift.git`,
   `from: "0.4.3"` (upstream: `torlando-tech/reticulum-swift`, `from: "0.3.0"`).
 - A commented-out `.package(path: "../reticulum-swift")` line is kept for local development.
-- SWCompression went to `exact: "4.8.7"` in `ce27afc` and back to the `"4.8.0" ..< "4.9.0"`
-  range in `457eb4e`, so on this axis the fork is now identical to upstream. The cap itself
-  is upstream's and its rationale is unchanged (4.9.0 raises the floor to macOS 14 / iOS 17,
-  above this library's macOS 13 / iOS 16 floor); only the freedom to pick another 4.8.x came
-  back.
+- SWCompression went to `exact: "4.8.7"` in `ce27afc` and back to upstream's `"4.8.0" ..< "4.9.0"`
+  range in `457eb4e`. It diverges again since the 4.9 bump — see [D11](#d11).
 
 **Why it matters:** D4 and D5 call APIs that exist only in the forked reticulum-swift
 (`PathTable.markPathUnresponsive`, `ReticulumTransport.sendFallbackCopy`), so the two forks
@@ -246,6 +245,11 @@ intermediate state mid-restore; the exported file carries no explicit iOS file-p
 class; and the router's in-memory state (`pendingOutbound`, `deliveredTransientIDs`) is not
 reset after a restore, so callers must reload the router.
 
+**Tests:** `Tests/LXMFSwiftTests/LXMFDatabaseExportImportTests.swift` (fork-only file, added with
+[D11](#d11)) — export writes one file with no WAL/SHM sidecars, export refuses an existing
+destination, import replaces the live contents and conversation counts, the same instance stays
+writable, and an unmigrated snapshot is forward-migrated. The known gaps above are not covered.
+
 ## D7 — Repo hygiene {#d7}
 
 **Commits:** `facae56`
@@ -343,6 +347,31 @@ materialises every blob to arrive at the same number.
 Additive public API on the database type; registers no migration and changes no table — see
 [Schema & domain changes](#schema).
 
+## D11 — GRDB 7 and SWCompression 4.9 {#d11}
+
+**Commits:** _uncommitted_ (2026-09-15)
+
+**Files:** `Package.swift`, `Sources/LXMFSwift/Storage/LXMFDatabase.swift`
+
+- `GRDB.swift` `from: "7.11.1"` (upstream: `from: "6.0.0"`).
+- `SWCompression` `from: "4.9.1"` (upstream: `"4.8.0" ..< "4.9.0"`).
+- Platform floor macOS 14 / iOS 17 (upstream: macOS 13 / iOS 16). SWCompression 4.9 requires
+  it; this drops iOS 16 devices, which Analog (iOS 18 minimum) never ran on.
+- `LXMFDatabase.init` no longer sets `config.defaultTransactionKind = .immediate` — upstream
+  code whose property GRDB 7 removed. GRDB 7 manages the kind itself: writes IMMEDIATE, reads
+  DEFERRED, so the Model B writer still takes write locks up front.
+
+**Why:** done while getting the fork to build under Xcode 27 (2026-09-15).
+
+**Checked against GRDB 7's migration guide:** every database access in the fork is a synchronous
+`dbPool.read`/`write` inside the actor, so async-access cancellation doesn't apply; no
+`ValueObservation`; no record type declares the removed static coding-strategy properties (which
+would still compile but silently change the stored format). `swift test` passes (139 tests).
+
+**Re-sync risk:** upstream is still on GRDB 6. Any upstream change using removed GRDB 6 API —
+`defaultTransactionKind`, the static `database…Strategy` properties, `concurrentRead` — must be
+adapted when pulled in, and the static strategies won't fail the build.
+
 ---
 
 ## Re-sync checklist
@@ -354,8 +383,8 @@ When pulling new upstream work:
 3. Conflict-prone files, in order of likelihood:
    `Sources/LXMFSwift/Router/LXMRouter.swift` (D3, D4, **D9**, D8 call sites),
    `Sources/LXMFSwift/Router/LXMRouter+Delivery.swift` (D5, D8 call sites),
-   `Sources/LXMFSwift/Storage/LXMFDatabase.swift` (D6, D10),
-   `port-deviations.md` (D3), `Package.swift` (D1).
+   `Sources/LXMFSwift/Storage/LXMFDatabase.swift` (D6, D10, D11),
+   `port-deviations.md` (D3), `Package.swift` (D1, D11).
    `LXMRouter+NetworkDiagnostics.swift` (D8) is a new file and cannot conflict; it is listed
    here only because its call sites live in the two files above.
    **Start with [D9](#d9)** — it rewrites the middle of `processOutbound` and redefines what
@@ -364,8 +393,10 @@ When pulling new upstream work:
    [Schema & domain changes](#schema). Upstream numbering ours by collision (two different
    `v7`s) is the failure mode to look for — resolve by renaming ours to a later
    `vN_kvf_…`, never by editing an already-shipped migration.
-5. `swift build && swift test`.
-6. Update the base/HEAD/last-reviewed lines at the top of this file, append any new
+5. Grep incoming upstream storage code for GRDB 6-only API ([D11](#d11)): `defaultTransactionKind`,
+   `static … database…Strategy`, `concurrentRead`.
+6. `swift build && swift test`.
+7. Update the base/HEAD/last-reviewed lines at the top of this file, append any new
    fork commits to the [commit ledger](#summary), and refresh
    [Status at generation](#status) + add a [Document changelog](#doc-changelog) row.
 
@@ -409,6 +440,7 @@ HEAD the file described at that point.
 
 | Date | Covers | Change |
 |------|--------|--------|
+| 2026-09-15 | `ef0c712` + uncommitted | Added [D11](#d11) (GRDB 7, SWCompression 4.9, macOS 14 / iOS 17) and [D6](#d6)'s tests; D1 no longer carries SWCompression; re-sync checklist gains the GRDB 6 API grep. Commits `19f7c6b`, `49061a6`, `93e3d0c` since `457eb4e` are not yet audited into the ledger. |
 | 2026-08-19 | `457eb4e` | Added [D8](#d8) (queue diagnostics), [D9](#d9) (pathless retry / unproven-route invalidation) and [D10](#d10) (message count). Corrected [D1](#d1): reticulum floor is 0.4.3 and the SWCompression pin went back to upstream's range. Refreshed the ledger, re-sync checklist and status. |
 | 2026-08-02 | `e719af4` | Added [Status at generation](#status) and this changelog. |
 | 2026-08-02 | `e719af4` | Added commit IDs: `Commits` column in the summary table, the [commit ledger](#summary), per-section `**Commits:**` lines on D1–D7, and a `Commit` column in the schema ledger. |
