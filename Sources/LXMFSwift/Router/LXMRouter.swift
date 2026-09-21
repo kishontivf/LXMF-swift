@@ -186,6 +186,10 @@ public actor LXMRouter {
     /// Active and pending links for direct delivery
     public var deliveryLinks: [Data: Link] = [:]
 
+    /// A delivery link's handshake that failed on its watcher task, held until the next attempt for
+    /// that destination consumes it — so the failure bills the attempt exactly as the old inline wait did.
+    var linkEstablishmentFailures: [Data: LXMFError] = [:]
+
     /// Map outbound resource hash → message hash for delivery confirmation.
     /// When RESOURCE_PRF is received, we look up the message hash here to mark it delivered.
     public var pendingResourceDeliveries: [Data: Data] = [:]
@@ -1143,6 +1147,13 @@ public actor LXMRouter {
                     // Unknown method, skip
                     break
                 }
+            } catch LXMFError.linkPending {
+                // The link is handshaking on its own task (`watchLinkEstablishment`), which releases
+                // this entry when it resolves. Nothing was sent, so the attempt isn't billed; the
+                // timeout is only a backstop in case the release never comes.
+                pendingOutbound[i].deliveryAttempts = max(0, pendingOutbound[i].deliveryAttempts - 1)
+                pendingOutbound[i].nextDeliveryAttempt =
+                    Date().addingTimeInterval(LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
             } catch LXMFError.noPath {
                 // The send never reached the wire — a path vanished between the check above and the
                 // send itself (routine while a radio is going down). Identical accounting to the

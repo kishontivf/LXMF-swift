@@ -669,6 +669,23 @@ periodic flush reach disk on a graceful stop. Mirrors python's `exit_handler` ca
 `save_locally_delivered_transient_ids()` (LXMRouter.py:1365). Making `shutdown()` async is
 transparent — every caller already `await`s it (it's an actor method). Flagged by greptile on PR #9.
 
+### `getOrEstablishLink` — link handshake off the outbound loop (2026-09-21)
+
+**Sites:** `LXMRouter+Delivery.swift` — `getOrEstablishLink` starts the link, hands it to
+`watchLinkEstablishment` and throws `LXMFError.linkPending`; `processOutbound` refunds that attempt
+and parks the entry; the watcher releases it on activation, or records the failure for the next
+attempt to bill. Tests: `LXMRouterLinkNonBlockingTests.swift`.
+
+**Python reference:** `LXMRouter.process_outbound` DIRECT branch — establishes the link, returns, and
+retries when `link_established` fires; it never blocks the loop on a handshake.
+
+**Reason:** the port awaited the handshake inline for up to `LINK_ESTABLISHMENT_TIMEOUT` (30 s), and
+the outbound loop is sequential, so one unreachable peer stalled every queued message. Session23:
+WebRTC signalling to a peer that had left held chat messages for minutes; they only arrived via the
+15 s propagated copy.
+
+**Upstream-worthy:** yes — it restores python's non-blocking behaviour.
+
 ### `getOrEstablishLink` — replace a cached link stranded on an old interface (2026-09-21)
 
 **Sites:** `LXMRouter+Delivery.swift` — `getOrEstablishLink` consults `linkShouldMove` before

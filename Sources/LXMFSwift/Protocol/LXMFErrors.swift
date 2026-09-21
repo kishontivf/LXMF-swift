@@ -36,6 +36,9 @@ public enum LXMFError: Error, Sendable {
     /// Link establishment or operation failed
     case linkFailed(String)
 
+    /// A delivery link is still handshaking on its own task — not a failed attempt
+    case linkPending
+
     /// Maximum retry attempts exceeded
     case maxAttemptsExceeded
 
@@ -93,6 +96,8 @@ extension LXMFError: LocalizedError {
             return "No path available to destination"
         case .linkFailed(let detail):
             return "Link operation failed: \(detail)"
+        case .linkPending:
+            return "Delivery link is still being established"
         case .maxAttemptsExceeded:
             return "Maximum delivery attempts exceeded"
         case .invalidStateTransition(let from, let to):

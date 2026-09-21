@@ -459,6 +459,10 @@ extension LXMRouter {
         if let link = deliveryLinks[destinationHash] {
             // Verify link is still active
             let state = await link.state
+            if state == .pending || state == .handshake {
+                // Its watcher owns the outcome; waiting here would stall every message behind this one.
+                throw LXMFError.linkPending
+            }
             if state == .active {
                 guard await linkShouldMove(link, to: destinationHash, transport: transport) else { return link }
                 // Re-checked after the suspension: a concurrent send may already have replaced it.
@@ -471,6 +475,12 @@ extension LXMRouter {
                 // Remove stale link
                 deliveryLinks.removeValue(forKey: destinationHash)
             }
+        }
+
+        // A handshake that failed since the last attempt is reported now, so it bills this attempt
+        // (and backs off) instead of re-dialling an unreachable peer on every pass.
+        if let failure = linkEstablishmentFailures.removeValue(forKey: destinationHash) {
+            throw failure
         }
 
         // Resolve recipient identity. For self-send (own delivery
@@ -546,45 +556,70 @@ extension LXMRouter {
         // Also store in our delivery links for message routing
         deliveryLinks[destinationHash] = link
 
-        // Wait for link to become active (with timeout)
-        // Link will transition: pending -> handshake -> active
-        // when PROOF packet is received
-        let linkWaitStarted = ContinuousClock.now
-        do {
-            try await waitForLinkActive(link, timeout: LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
-            logLinkEstablishment(destination: destinationHash, started: linkWaitStarted, outcome: "ACTIVE")
-        } catch {
-            logLinkEstablishment(destination: destinationHash,
-                                 started: linkWaitStarted,
-                                 outcome: "TIMEOUT/FAILED (\(error.localizedDescription))")
-            // Clean up stale pending link from transport to prevent accumulation.
-            // Without this, each failed attempt leaves a stale entry in pendingLinks,
-            // causing link establishment delay (each retry creates a new link_id but
-            // old ones are never cleaned up, and the receiver may respond to an old one).
-            let linkId = await link.linkId
-            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            routerLogger.warning("Cleaning up stale pending link \(linkIdHex)")
-            await transport.unregisterLink(linkId: linkId)
-            deliveryLinks.removeValue(forKey: destinationHash)
-            throw error
+        // **FORK DEVIATION** — the handshake is awaited on its own task, not inline. The outbound
+        // loop is sequential, so an inline wait let one unreachable peer hold every queued message
+        // for LINK_ESTABLISHMENT_TIMEOUT per attempt (Session23: chat queued behind WebRTC signals
+        // for minutes). Python LXMF likewise starts the link and moves on.
+        watchLinkEstablishment(link, to: destinationHash, transport: transport)
+        throw LXMFError.linkPending
+    }
+
+    /// Await a delivery link's handshake off the outbound loop, then release the messages waiting on it.
+    private func watchLinkEstablishment(_ link: Link, to destinationHash: Data, transport: ReticulumTransport) {
+        Task { [weak self] in
+            let started = ContinuousClock.now
+            do {
+                try await self?.waitForLinkActive(link, timeout: LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
+                await self?.deliveryLinkEstablished(link, to: destinationHash, started: started)
+            } catch {
+                await self?.deliveryLinkFailed(link, to: destinationHash, transport: transport,
+                                               started: started, error: error)
+            }
         }
+    }
+
+    private func deliveryLinkEstablished(_ link: Link, to destinationHash: Data, started: ContinuousClock.Instant) async {
+        // A newer link (or a teardown) replaced this one while it was handshaking.
+        guard deliveryLinks[destinationHash] === link else { return }
+        logLinkEstablishment(destination: destinationHash, started: started, outcome: "ACTIVE")
 
         // Wire an unexpected-close callback on the now-ACTIVE link — the swift analog of
-        // python's `process_outbound` CLOSED branch (LXMRouter.py:2628-2647). If the link
-        // drops unexpectedly (peer gone / network drop) while a DIRECT small-packet is in
-        // flight, react at once — pop the dead link + request a fresh path — instead of
-        // waiting out the full DELIVERY_RETRY_WAIT gate. Wired only here, AFTER the link is
-        // active (mirroring python's `activated_at != None` guard, LXMRouter.py:2629), so the
-        // handshake-failure cleanup above never has a callback to reason about. Capture the
-        // linkId for the handler's identity guard (so a stale OLD-link callback can't clobber
-        // a message already re-sent over a NEWER link).
+        // python's `process_outbound` CLOSED branch (LXMRouter.py:2628-2647). Wired only once the
+        // link is active (python's `activated_at != None` guard, LXMRouter.py:2629); the linkId is
+        // captured so a stale OLD-link callback can't clobber a message re-sent over a NEWER link.
         let establishedLinkId = await link.linkId
         await link.setCloseCallback { [weak self] reason in
             await self?.handleLinkUnexpectedClose(
                 destinationHash: destinationHash, linkId: establishedLinkId, reason: reason)
         }
+        await releaseMessagesWaitingOnLink(to: destinationHash)
+    }
 
-        return link
+    private func deliveryLinkFailed(_ link: Link, to destinationHash: Data, transport: ReticulumTransport,
+                                    started: ContinuousClock.Instant, error: Error) async {
+        logLinkEstablishment(destination: destinationHash,
+                             started: started,
+                             outcome: "TIMEOUT/FAILED (\(error.localizedDescription))")
+        // Clean up the stale pending link so failed attempts don't accumulate in the transport's
+        // pendingLinks (each retry has a new link_id, and the receiver may answer an old one).
+        let linkId = await link.linkId
+        routerLogger.warning("Cleaning up stale pending link \(linkId.prefix(8).map { String(format: "%02x", $0) }.joined())")
+        await transport.unregisterLink(linkId: linkId)
+        guard deliveryLinks[destinationHash] === link else { return }
+        deliveryLinks.removeValue(forKey: destinationHash)
+        linkEstablishmentFailures[destinationHash] = (error as? LXMFError) ?? .linkFailed(error.localizedDescription)
+        await releaseMessagesWaitingOnLink(to: destinationHash)
+    }
+
+    /// Make the DIRECT entries parked on a link handshake due now and run a pass for them.
+    private func releaseMessagesWaitingOnLink(to destinationHash: Data) async {
+        for i in pendingOutbound.indices
+        where pendingOutbound[i].destinationHash == destinationHash
+            && pendingOutbound[i].method == .direct
+            && pendingOutbound[i].state == .outbound {
+            pendingOutbound[i].nextDeliveryAttempt = Date()
+        }
+        await processOutbound()
     }
 
     /// Get local identity for link establishment.
