@@ -90,6 +90,15 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
     /// JSON-encoded reactions for this message (optional)
     public var reactionsJson: String?
 
+    /// Replacement content after the author edited the message (optional)
+    public var editedContent: Data?
+
+    /// When the latest applied edit was made, in the editor's clock (optional)
+    public var editedAt: Double?
+
+    /// When the author deleted the message for everyone (optional)
+    public var deletedAt: Double?
+
     /// Packed LXMF wire format (for retransmission)
     public var packedLxmf: Data
 
@@ -124,6 +133,9 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         case receivingInterface = "receiving_interface"
         case replyToId = "reply_to_id"
         case reactionsJson = "reactions_json"
+        case editedContent = "edited_content"
+        case editedAt = "edited_at"
+        case deletedAt = "deleted_at"
         case packedLxmf = "packed_lxmf"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
@@ -170,14 +182,20 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         self.ratchetId = nil
         self.receivingInterface = message.receivingInterface
 
-        // Extract reply_to from FIELD_APP_DATA (field 0x10)
-        if let appData = message.fields?[LXMessage.FIELD_APP_DATA] as? [String: Any],
-           let replyTo = appData["reply_to"] as? String {
+        // Standard FIELD_REPLY_TO (0x30) first, then the legacy Columba FIELD_APP_DATA (0x10)
+        if let replyTo = message.fields?[LXMessage.FIELD_REPLY_TO] as? Data, !replyTo.isEmpty {
+            self.replyToId = replyTo.map { String(format: "%02x", $0) }.joined()
+        } else if let appData = message.fields?[LXMessage.FIELD_APP_DATA] as? [String: Any],
+                  let replyTo = appData["reply_to"] as? String {
             self.replyToId = replyTo
         } else {
             self.replyToId = nil
         }
-        self.reactionsJson = nil  // Accumulated separately via updateReactions
+        // Annotations accumulate separately; `LXMFDatabase.saveMessage` carries them over on re-save.
+        self.reactionsJson = nil
+        self.editedContent = nil
+        self.editedAt = nil
+        self.deletedAt = nil
 
         let now = Date().timeIntervalSince1970
         self.createdAt = now

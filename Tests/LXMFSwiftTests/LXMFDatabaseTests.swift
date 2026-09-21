@@ -304,4 +304,51 @@ final class LXMFDatabaseTests: XCTestCase {
         XCTAssertEqual(conversations[0].unreadCount, 1, "Unread count should be 1 for incoming message")
         XCTAssertTrue(conversations[0].hasUnreadMessages, "hasUnreadMessages should be true")
     }
+
+    // MARK: - Annotation Tests
+
+    /// A router re-save (state change) must not wipe reactions applied to the row since.
+    func testResaveKeepsReactions() async throws {
+        let db = try makeDatabase()
+
+        var message = LXMessage(
+            destinationHash: Identity().hash,
+            sourceIdentity: Identity(),
+            content: "Reacted to".data(using: .utf8)!,
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try message.pack()
+        try await db.saveMessage(message)
+        try await db.updateReactions(messageId: message.hash, reactionsJson: #"{"👍":["abcd"]}"#)
+
+        message.state = .delivered
+        try await db.saveMessage(message)
+
+        let reactions = try await db.getReactionsJson(messageId: message.hash)
+        XCTAssertEqual(reactions, #"{"👍":["abcd"]}"#)
+        let record = try await db.getMessageRecord(id: message.hash)
+        XCTAssertEqual(record?.state, LXMessageState.delivered.rawValue)
+    }
+
+    /// The standard FIELD_REPLY_TO (0x30) carries raw hash bytes; the record keeps them as hex.
+    func testReplyToFromStandardField() async throws {
+        let db = try makeDatabase()
+        let target = Data((0..<32).map { UInt8($0) })
+
+        var message = LXMessage(
+            destinationHash: Identity().hash,
+            sourceIdentity: Identity(),
+            content: "Reply".data(using: .utf8)!,
+            title: Data(),
+            fields: [LXMessage.FIELD_REPLY_TO: target],
+            desiredMethod: .direct
+        )
+        _ = try message.pack()
+        try await db.saveMessage(message)
+
+        let record = try await db.getMessageRecord(id: message.hash)
+        XCTAssertEqual(record?.replyToId, target.map { String(format: "%02x", $0) }.joined())
+    }
 }

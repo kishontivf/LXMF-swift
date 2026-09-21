@@ -183,6 +183,15 @@ public actor LXMFDatabase {
             try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
         }
 
+        // v7: Edit / delete-for-everyone annotations on messages
+        migrator.registerMigration("v7_message_annotations") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "edited_content", .blob)
+                t.add(column: "edited_at", .double)
+                t.add(column: "deleted_at", .double)
+            }
+        }
+
         return migrator
     }
 
@@ -231,10 +240,18 @@ public actor LXMFDatabase {
             // Update/create conversation FIRST (foreign key requires it)
             try self.updateConversationForMessage(message, in: db)
 
-            // Create message record
-            let record = try MessageRecord(from: message)
+            var record = try MessageRecord(from: message)
 
-            // Save message (insert or replace)
+            // The router re-saves a message on every state change; a plain replace would wipe
+            // the annotations (reactions, edits, deletion) that were applied to the row since.
+            if let existing = try MessageRecord.filter(Column("message_id") == message.hash).fetchOne(db) {
+                record.replyToId = record.replyToId ?? existing.replyToId
+                record.reactionsJson = existing.reactionsJson
+                record.editedContent = existing.editedContent
+                record.editedAt = existing.editedAt
+                record.deletedAt = existing.deletedAt
+                record.createdAt = existing.createdAt
+            }
             try record.save(db)
         }
     }
@@ -628,6 +645,34 @@ public actor LXMFDatabase {
                 sql: "UPDATE messages SET reactions_json = ?, updated_at = ? WHERE message_id = ?",
                 arguments: [reactionsJson, Date().timeIntervalSince1970, messageId]
             )
+        }
+    }
+
+    /// Read-modify-write of one message's reactions JSON inside a single transaction, so two
+    /// concurrent toggles can't both read the old value and lose one of the updates.
+    ///
+    /// - Parameters:
+    ///   - messageId: Message hash (32 bytes)
+    ///   - transform: Given the stored record, returns the new reactions JSON (`nil` = leave the
+    ///     row untouched) and a result to hand back to the caller
+    /// - Returns: The transform's result, or `nil` if no such message exists
+    /// - Throws: DatabaseError
+    public func updateReactions<Result: Sendable>(
+        messageId: Data,
+        _ transform: @Sendable (MessageRecord) -> (reactionsJson: String?, result: Result)
+    ) throws -> Result? {
+        try dbPool.write { db in
+            guard let record = try MessageRecord.filter(Column("message_id") == messageId).fetchOne(db) else {
+                return nil
+            }
+            let outcome = transform(record)
+            if let json = outcome.reactionsJson {
+                try db.execute(
+                    sql: "UPDATE messages SET reactions_json = ?, updated_at = ? WHERE message_id = ?",
+                    arguments: [json, Date().timeIntervalSince1970, messageId]
+                )
+            }
+            return outcome.result
         }
     }
 

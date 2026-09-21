@@ -38,6 +38,12 @@ public struct LXMessage {
     public static let FIELD_IMAGE: UInt8 = 0x06
     public static let FIELD_AUDIO: UInt8 = 0x07
     public static let FIELD_APP_DATA: UInt8 = 0x10  // Field 16: app extensions (replies, reactions)
+    // Reply / reaction standard from upstream LXMF.py (764758d, "to be finalized in 1.0.0").
+    public static let FIELD_REPLY_TO: UInt8 = 0x30       // Bytes, full LXMessage.hash
+    public static let FIELD_REPLY_QUOTE: UInt8 = 0x31    // Bytes, quoted content in UTF-8
+    public static let FIELD_REACTION: UInt8 = 0x40       // Dict keyed by REACTION_TO / REACTION_CONTENT
+    public static let REACTION_TO: UInt8 = 0x00          // Bytes, full LXMessage.hash
+    public static let REACTION_CONTENT: UInt8 = 0x01     // Bytes, reaction content in UTF-8
     public static let FIELD_COLUMBA_META: UInt8 = 0x70
 
     // MARK: - Properties
@@ -204,6 +210,15 @@ public struct LXMessage {
                     // Handles flat arrays (Field 4 icon appearance) and nested arrays
                     // (Field 5 file attachments: [[filename, data], ...])
                     fieldsMap[keyValue] = .array(Self.convertArrayToMsgpack(arrayValue))
+                } else if let intKeyedValue = value as? [UInt8: Any] {
+                    // Int-keyed nested dict, e.g. FIELD_REACTION {REACTION_TO: bytes, REACTION_CONTENT: bytes}
+                    var nestedMap: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
+                    for (k, v) in intKeyedValue {
+                        if let packedValue = Self.scalarToMsgpack(v) {
+                            nestedMap[.uint(UInt64(k))] = packedValue
+                        }
+                    }
+                    fieldsMap[keyValue] = .map(nestedMap)
                 } else if let dictValue = value as? [String: Any] {
                     // Convert nested dict to MessagePack
                     var nestedMap: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
@@ -312,6 +327,8 @@ public struct LXMessage {
             throw LXMFError.invalidMessageFormat("Payload is not an array: \(payloadValue), hex=\(payloadHex)")
         }
 
+        let receivedElements = payloadArray
+
         // Extract stamp if present (5th element)
         var stamp: Data? = nil
         if payloadArray.count > 4 {
@@ -418,6 +435,10 @@ public struct LXMessage {
                     // (Field 5 file attachments: [[filename, data], ...])
                     extractedFields[keyByte] = Self.convertMsgpackArrayToSwift(arr)
                 case .map(let nestedMap):
+                    if let intKeyed = Self.intKeyedDictionary(from: nestedMap) {
+                        extractedFields[keyByte] = intKeyed
+                        continue
+                    }
                     // Convert nested map to [String: Any]
                     var nestedDict: [String: Any] = [:]
                     for (nk, nv) in nestedMap {
@@ -443,8 +464,9 @@ public struct LXMessage {
         }
 
         // Recompute hash (without stamp)
-        let payloadForHash = LXMFMessagePackValue.array(payloadArray)
-        let packedPayloadForHash = packLXMF(payloadForHash)
+        let packedPayloadForHash = Self.hashedPayloadBytes(received: contiguousPayload,
+                                                           elements: receivedElements,
+                                                           strippedTo: payloadArray)
 
         var hashedPart = Data()
         hashedPart.append(destinationHash)
@@ -565,6 +587,70 @@ public struct LXMessage {
         self.unverifiedReason = nil
         self.sourceIdentity = nil
         self.packed = nil
+    }
+
+    // MARK: - Hash Input Helpers
+
+    /// The payload bytes the sender hashed: the received bytes themselves, minus a trailing stamp.
+    ///
+    /// Re-encoding the decoded payload is not a substitute. Maps decode into a Swift `Dictionary`,
+    /// whose iteration order is randomised per process, so any field holding a map with two or more
+    /// entries re-encodes in a different key order than the sender used — the hash then differs and
+    /// a genuine signature fails to verify. The re-encoding stays only as a fallback for layouts
+    /// this cannot slice (more than one trailing element, or a non-fixarray header).
+    static func hashedPayloadBytes(received: Data,
+                                   elements: [LXMFMessagePackValue],
+                                   strippedTo hashed: [LXMFMessagePackValue]) -> Data {
+        if elements.count == hashed.count {
+            return received
+        }
+        if elements.count == hashed.count + 1, hashed.count == 4,
+           received.first == 0x95, let trailing = elements.last {
+            let trailingBytes = packLXMF(trailing)
+            if received.count > trailingBytes.count + 1, received.suffix(trailingBytes.count) == trailingBytes {
+                var bytes = Data([0x94])
+                bytes.append(received.dropFirst().dropLast(trailingBytes.count))
+                return bytes
+            }
+        }
+        return packLXMF(.array(hashed))
+    }
+
+    // MARK: - Nested Map Helpers
+
+    /// Scalar Swift value to MessagePack, for values inside a nested field map.
+    private static func scalarToMsgpack(_ value: Any) -> LXMFMessagePackValue? {
+        if let data = value as? Data { return .binary(data) }
+        if let string = value as? String { return .string(string) }
+        if let int = value as? Int { return .int(Int64(int)) }
+        if let double = value as? Double { return .double(double) }
+        if let bool = value as? Bool { return .bool(bool) }
+        return nil
+    }
+
+    /// A nested map whose keys are all small integers, as `[UInt8: Any]`; `nil` for any other map,
+    /// which keeps the existing string-keyed decoding for those.
+    private static func intKeyedDictionary(from map: [LXMFMessagePackValue: LXMFMessagePackValue]) -> [UInt8: Any]? {
+        guard !map.isEmpty else { return nil }
+        var result: [UInt8: Any] = [:]
+        for (key, value) in map {
+            let keyByte: UInt8
+            switch key {
+            case .uint(let k) where k <= 255: keyByte = UInt8(k)
+            case .int(let k) where k >= 0 && k <= 255: keyByte = UInt8(k)
+            default: return nil
+            }
+            switch value {
+            case .binary(let data): result[keyByte] = data
+            case .string(let str): result[keyByte] = str
+            case .int(let int): result[keyByte] = int
+            case .uint(let uint): result[keyByte] = Int64(uint)
+            case .double(let dbl): result[keyByte] = dbl
+            case .bool(let b): result[keyByte] = b
+            default: break
+            }
+        }
+        return result
     }
 
     // MARK: - Array Conversion Helpers
