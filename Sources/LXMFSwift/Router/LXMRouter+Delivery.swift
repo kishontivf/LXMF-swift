@@ -460,10 +460,17 @@ extension LXMRouter {
             // Verify link is still active
             let state = await link.state
             if state == .active {
-                return link
+                guard await linkShouldMove(link, to: destinationHash, transport: transport) else { return link }
+                // Re-checked after the suspension: a concurrent send may already have replaced it.
+                if deliveryLinks[destinationHash] === link {
+                    await closeAndRemoveDeliveryLink(destinationHash)
+                } else if let replacement = deliveryLinks[destinationHash], await replacement.state == .active {
+                    return replacement
+                }
+            } else {
+                // Remove stale link
+                deliveryLinks.removeValue(forKey: destinationHash)
             }
-            // Remove stale link
-            deliveryLinks.removeValue(forKey: destinationHash)
         }
 
         // Resolve recipient identity. For self-send (own delivery
@@ -682,6 +689,24 @@ extension LXMRouter {
             await transport.removeProofCallback(truncatedHash: packetTruncatedHash)
             throw error
         }
+    }
+
+    /// Whether an active cached link should be replaced by one on the current route.
+    ///
+    /// **FORK DEVIATION** — python keeps a direct link until it closes or idles out. A link sends
+    /// only on the interface it was established on, so a link opened over the TCP relay would
+    /// otherwise keep carrying large messages after a direct carrier (WiFi/WebRTC) took the route.
+    /// Moves only onto a NON-fallback interface: bulk over the relay beats bulk over BLE, so a
+    /// route that moved to BLE keeps the existing link. Never interrupts a resource transfer.
+    func linkShouldMove(_ link: Link, to destinationHash: Data, transport: ReticulumTransport) async -> Bool {
+        guard let attachedId = await link.attachedInterfaceId else { return false }
+        // The interface is gone (e.g. a carrier child despawned): the link can no longer send.
+        guard await transport.interfaceIds.contains(attachedId) else { return true }
+        guard await link.readyForNewResource(), await link.incomingResourceCount == 0,
+              let pathTable = self.pathTable,
+              let entry = await pathTable.lookup(destinationHash: destinationHash),
+              entry.interfaceId != attachedId else { return false }
+        return !(await pathTable.isBestPathFallback(destinationHash))
     }
 
     /// Tear down the cached delivery link to `destinationHash` (sending a LINKCLOSE) and drop

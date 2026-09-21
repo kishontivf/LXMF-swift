@@ -669,6 +669,22 @@ periodic flush reach disk on a graceful stop. Mirrors python's `exit_handler` ca
 `save_locally_delivered_transient_ids()` (LXMRouter.py:1365). Making `shutdown()` async is
 transparent — every caller already `await`s it (it's an actor method). Flagged by greptile on PR #9.
 
+### `getOrEstablishLink` — replace a cached link stranded on an old interface (2026-09-21)
+
+**Sites:** `LXMRouter+Delivery.swift` — `getOrEstablishLink` consults `linkShouldMove` before
+reusing an active delivery link. Tests: `LXMRouterLinkMoveTests.swift`.
+
+**Python reference:** `LXMRouter.process_outbound` reuses `direct_links[dest]` while ACTIVE; links
+otherwise end only by closing or `LINK_MAX_INACTIVITY` (10 min, not ported here).
+
+**Reason:** a link sends only on the interface it was established on, and keepalives keep it alive
+indefinitely — so a link opened over the TCP relay kept carrying large messages after a direct
+carrier took the route. The link is replaced when its interface is gone, or when the route moved to
+another **non-fallback** interface and no resource is in flight. A route that moved to a fallback
+(BLE) keeps the existing link: the embedder prefers bulk over the relay to bulk over BLE.
+
+**Upstream-worthy:** partly — the "interface gone" case is general; the fallback rule is ours.
+
 ## Resolved deviations
 
 (none yet — this file was created during the iOS smoke-pipeline
