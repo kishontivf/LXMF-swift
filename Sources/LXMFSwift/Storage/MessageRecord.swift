@@ -233,3 +233,13 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         return message
     }
 }
+
+/// What `LXMFDatabase.markDeleted` did.
+public enum MessageDeletionOutcome: Sendable, Equatable {
+    case deleted
+    /// The row was deleted before; nothing changed.
+    case alreadyDeleted
+    /// The row failed the caller's check (e.g. not the author); nothing changed.
+    case notAllowed
+    case notFound
+}
