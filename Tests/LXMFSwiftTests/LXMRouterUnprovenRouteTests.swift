@@ -10,7 +10,7 @@
 //
 //  Pins the handling of a route that accepts sends but never returns a delivery proof.
 //
-//  Field test 2026-08-12 (Session04): a peer that was merely out of BLE range still had a
+//  Field test 2026-08-12: a peer that was merely out of BLE range still had a
 //  stale 4-hop relay path in the table, so `hasPath` was true and every send "succeeded" at
 //  the transport layer. No proof ever came back, the message burned all 8 attempts in 71-87s,
 //  and was permanently discarded — 21 messages lost that way in one short walk, including a
@@ -107,7 +107,7 @@ final class LXMRouterUnprovenRouteTests: XCTestCase {
     }
 
     /// Detecting a dead ROUTE must be fast, and is independent of how long the MESSAGE lives.
-    /// Session05 measured 354s of replies fired into an `icWifi0` path belonging to a LAN the
+    /// One field test measured 354s of replies fired into an `icWifi0` path belonging to a LAN the
     /// peer had already left, because invalidation waited for the whole attempt budget.
     func testDeadRouteIsClearedLongBeforeTheBudgetIsSpent() async throws {
         let router = try await makeRouter()
@@ -163,7 +163,7 @@ final class LXMRouterUnprovenRouteTests: XCTestCase {
     }
 
     /// A message merely climbing the pathless backoff curve — never parked — must also be released
-    /// when its destination becomes reachable. Session06 lost ~105s to exactly this case: the
+    /// when its destination becomes reachable. One field test lost ~105s to exactly this case: the
     /// backoff had reached ~128s and was served out in full after connectivity had returned.
     func testBackedOffMessageIsReleasedWhenPathReturnsEvenIfNeverParked() async throws {
         let router = try await makeRouter()
@@ -194,7 +194,7 @@ final class LXMRouterUnprovenRouteTests: XCTestCase {
     }
 
     /// Clearing the same destination's path repeatedly is churn: each clear also fires a path
-    /// request, and a stale announce simply re-learns the route. Session06 did this 366 times.
+    /// request, and a stale announce simply re-learns the route. One field test did this 366 times.
     func testPathInvalidationIsRateLimitedPerDestination() async throws {
         let router = try await makeRouter()
         let destination = Data((0..<16).map { _ in UInt8.random(in: 0...255) })

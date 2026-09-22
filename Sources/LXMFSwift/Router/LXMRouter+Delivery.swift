@@ -558,7 +558,7 @@ extension LXMRouter {
 
         // **FORK DEVIATION** — the handshake is awaited on its own task, not inline. The outbound
         // loop is sequential, so an inline wait let one unreachable peer hold every queued message
-        // for LINK_ESTABLISHMENT_TIMEOUT per attempt (Session23: chat queued behind WebRTC signals
+        // for LINK_ESTABLISHMENT_TIMEOUT per attempt (on one occasion chat queued behind WebRTC signals
         // for minutes). Python LXMF likewise starts the link and moves on.
         watchLinkEstablishment(link, to: destinationHash, transport: transport)
         throw LXMFError.linkPending

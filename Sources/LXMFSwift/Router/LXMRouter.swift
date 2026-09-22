@@ -840,8 +840,8 @@ public actor LXMRouter {
             //
             // This used to call `markPathUnresponsive`, which keeps the entry: a transport node
             // still re-announcing the stale route simply re-asserts it, so every retry went back
-            // into the same hole (Session04). Waiting for the full attempt budget instead was
-            // worse — Session05 measured 354s of replies fired into an `icWifi0` path belonging
+            // into the same hole. Waiting for the full attempt budget instead was
+            // worse — one field test measured 354s of replies fired into an `icWifi0` path belonging
             // to a LAN the peer had already left, while a working route sat unused. Clearing the
             // entry here lets the next announce win the path on merit, within ~15s.
             if pendingOutbound[i].deliveryAttempts == Self.PATH_DEMOTE_ATTEMPTS,
@@ -1916,13 +1916,13 @@ public actor LXMRouter {
     ///
     /// Without this the park is a fixed `UNPROVEN_ROUTE_RETRY_WAIT`, which in the field meant a
     /// message sat on a 5-minute timer while a perfectly good route was already available — the
-    /// replies that finally arrived "much later, over WebRTC and BLE" in Session05. The park
+    /// replies that finally arrived "much later, over WebRTC and BLE" in one field test. The park
     /// exists to stop us hammering a destination we cannot reach, so it should end the instant
     /// that stops being true.
     ///
     /// Applies to anything waiting *because it had nowhere to send* — whether parked by
     /// ROUTE-EXHAUSTED or merely climbing the pathless backoff curve. Restricting it to parked
-    /// messages was too narrow: in Session06 a message served out ~105s of accumulated backoff
+    /// messages was too narrow: in one field test a message served out ~105s of accumulated backoff
     /// after connectivity had already returned, because it had never been parked at all.
     ///
     /// Costs one path lookup per distinct stuck destination per pass — nothing when the queue is
@@ -1970,7 +1970,7 @@ public actor LXMRouter {
     /// next announce — quite possibly a nearer carrier — win the path on merit.
     /// Rate-limited per destination: clearing a path makes the next announce re-learn it, and if
     /// that announce is the same stale route we would clear it again three attempts later. In
-    /// Session06 that loop fired 366 times fleet-wide (260 on one device, 228 aimed at a single
+    /// one field test that loop fired 366 times fleet-wide (260 on one device, 228 aimed at a single
     /// peer), each cycle also emitting a path request. The cooldown lets a re-learned route
     /// actually be tried before we write it off again.
     ///
