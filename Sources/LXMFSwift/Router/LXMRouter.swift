@@ -343,10 +343,15 @@ public actor LXMRouter {
     /// - Parameters:
     ///   - identity: Local identity for signing outbound messages
     ///   - databasePath: Path to SQLite database (use ":memory:" for testing)
+    ///   - isSilentMessage: FORK ADDITION. Handed to this router's own store — see
+    ///     ``LXMFDatabase/isSilentMessage``. The router is what saves an inbound message, so a host
+    ///     that only configures its own `LXMFDatabase` on the same file configures the wrong one.
     /// - Throws: DatabaseError if database initialization fails
-    public init(identity: Identity, databasePath: String) async throws {
+    public init(identity: Identity,
+                databasePath: String,
+                isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)? = nil) async throws {
         self.identity = identity
-        self.database = try LXMFDatabase(path: databasePath)
+        self.database = try LXMFDatabase(path: databasePath, isSilentMessage: isSilentMessage)
 
         // Persist the duplicate-delivery dedup next to the message DB so it survives a
         // process restart (python loads `<storagepath>/local_deliveries`, LXMRouter.py:212-216).

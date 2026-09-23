@@ -17,14 +17,14 @@ import XCTest
 import ReticulumSwift
 
 final class LXMFDatabaseTests: XCTestCase {
-    private func makeDatabase() throws -> LXMFDatabase {
+    private func makeDatabase(isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)? = nil) throws -> LXMFDatabase {
         let dbPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("lxmf-db-tests-\(UUID().uuidString).db")
             .path
         addTeardownBlock {
             try? FileManager.default.removeItem(atPath: dbPath)
         }
-        return try LXMFDatabase(path: dbPath)
+        return try LXMFDatabase(path: dbPath, isSilentMessage: isSilentMessage)
     }
 
     // MARK: - Database Creation Tests
@@ -303,6 +303,76 @@ final class LXMFDatabaseTests: XCTestCase {
         XCTAssertEqual(conversations.count, 1, "Should have 1 conversation")
         XCTAssertEqual(conversations[0].unreadCount, 1, "Unread count should be 1 for incoming message")
         XCTAssertTrue(conversations[0].hasUnreadMessages, "hasUnreadMessages should be true")
+    }
+
+    /// FORK ADDITION. Control traffic is stored but says nothing: no unread, no preview, no
+    /// timestamp — so no compensating decrement is needed after the host drops the envelope.
+    func testSilentMessageLeavesConversationAlone() async throws {
+        let commandField: UInt8 = 0xC0
+        let db = try makeDatabase(isSilentMessage: { $0?[commandField] != nil })
+
+        let source = Identity()
+        let chat = try Self.incomingMessage(content: "Real message", fields: nil, from: source)
+        try await db.saveMessage(chat)
+        let command = try Self.incomingMessage(content: "", fields: [commandField: ["id", "a.command"] as [Any]],
+                                               from: source)
+        try await db.saveMessage(command)
+
+        let conversations = try await db.getConversations()
+        XCTAssertEqual(conversations.count, 1)
+        XCTAssertEqual(conversations[0].unreadCount, 1, "Only the chat message counts")
+        XCTAssertEqual(conversations[0].lastMessagePreview, "Real message", "A command must not move the preview")
+        XCTAssertEqual(conversations[0].lastMessageTimestamp, chat.timestamp, accuracy: 0.001)
+    }
+
+    /// The same field on a message that also says something is a real message.
+    func testSilentPredicateIgnoresMessagesWithContent() async throws {
+        let commandField: UInt8 = 0xC0
+        let db = try makeDatabase(isSilentMessage: { $0?[commandField] != nil })
+
+        let message = try Self.incomingMessage(content: "Said something",
+                                               fields: [commandField: ["id", "a.command"] as [Any]])
+        try await db.saveMessage(message)
+
+        let conversations = try await db.getConversations()
+        XCTAssertEqual(conversations[0].unreadCount, 1)
+    }
+
+    /// The router opens its own store, and it is the one that saves an inbound message — so the
+    /// rule has to reach that instance, not only a host's separate handle on the same file.
+    func testRouterStoreGetsTheSilenceRule() async throws {
+        let commandField: UInt8 = 0xC0
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxmf-router-silence-\(UUID().uuidString).db")
+            .path
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        let router = try await LXMRouter(identity: Identity(), databasePath: dbPath,
+                                         isSilentMessage: { $0?[commandField] != nil })
+        let command = try Self.incomingMessage(content: "",
+                                               fields: [commandField: ["id", "a.command"] as [Any]])
+        try await router.database.saveMessage(command)
+
+        let conversations = try await router.database.getConversations()
+        XCTAssertEqual(conversations.first?.unreadCount, 0)
+    }
+
+    /// An incoming message, the way the router hands one over: packed, then unpacked again.
+    private static func incomingMessage(content: String,
+                                        fields: [UInt8: Any]?,
+                                        from sourceIdentity: Identity = Identity()) throws -> LXMessage {
+        var message = LXMessage(
+            destinationHash: Identity().hash,
+            sourceIdentity: sourceIdentity,
+            content: content.data(using: .utf8)!,
+            title: Data(),
+            fields: fields,
+            desiredMethod: .direct
+        )
+        let packed = try message.pack()
+        var incoming = try LXMessage.unpackFromBytes(packed)
+        incoming.state = .delivered
+        return incoming
     }
 
     // MARK: - Annotation Tests

@@ -24,13 +24,28 @@ public actor LXMFDatabase {
 
     private let dbPool: DatabasePool
 
+    /// FORK ADDITION. Decides from a message's fields whether it is control traffic rather than
+    /// conversation. Such a message is still stored, but it never raises a conversation's unread
+    /// count and never moves its preview or timestamp. `nil` (the default) keeps the upstream
+    /// behaviour, where everything inbound counts.
+    ///
+    /// A closure rather than a set of field keys because the same key can carry either kind —
+    /// `FIELD_APP_DATA` holds both replies and a legacy client's reactions — so only the host's
+    /// own decoders can tell them apart. Called inside the write transaction, so it must stay pure.
+    private let isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)?
+
     // MARK: - Initialization
 
     /// Create or open LXMF database.
     ///
-    /// - Parameter path: Database file path
+    /// - Parameters:
+    ///   - path: Database file path
+    ///   - isSilentMessage: see ``isSilentMessage``
     /// - Throws: DatabaseError if initialization fails
-    public init(path: String, readonly: Bool = false) throws {
+    public init(path: String,
+                readonly: Bool = false,
+                isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)? = nil) throws {
+        self.isSilentMessage = isSilentMessage
         // App <-> Network-Extension share this database across processes (Model B).
         // The writer (the NE) must survive iOS's 0xDEAD10CC "file busy while suspended"
         // kill; the app opens read-only with `readonly: true`. (GRDB DatabaseSharing.)
@@ -817,6 +832,13 @@ public actor LXMFDatabase {
     private func updateConversationForMessage(_ message: LXMessage, in db: Database) throws {
         let conversationHash = message.incoming ? message.sourceHash : message.destinationHash
 
+        // FORK ADDITION. Control traffic leaves the conversation alone — see `isSilentMessage`.
+        // The row is still ensured, because the message's own foreign key needs it.
+        guard !isSilent(message) else {
+            try ensureConversationRow(conversationHash, in: db)
+            return
+        }
+
         // Try to fetch existing conversation
         if var conversation = try ConversationRecord
             .filter(Column("destination_hash") == conversationHash)
@@ -859,5 +881,24 @@ public actor LXMFDatabase {
 
             try conversation.insert(db)
         }
+    }
+
+    /// FORK ADDITION. Whether this message is control traffic: the host recognises its fields and
+    /// it says nothing of its own.
+    ///
+    /// The content check is the fork's own guard rather than the host's business — a control field
+    /// is also legal on a message that carries text, and that one is a real message.
+    private func isSilent(_ message: LXMessage) -> Bool {
+        guard let isSilentMessage, message.content.isEmpty else { return false }
+        return isSilentMessage(message.fields)
+    }
+
+    /// The empty row a stored message's foreign key needs, for a conversation nothing has been
+    /// said in yet. Leaves an existing row untouched.
+    private func ensureConversationRow(_ conversationHash: Data, in db: Database) throws {
+        guard try ConversationRecord
+            .filter(Column("destination_hash") == conversationHash)
+            .fetchCount(db) == 0 else { return }
+        try ConversationRecord(destinationHash: conversationHash, lastMessageTimestamp: 0).insert(db)
     }
 }
