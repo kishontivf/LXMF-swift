@@ -24,13 +24,28 @@ public actor LXMFDatabase {
 
     private let dbPool: DatabasePool
 
+    /// FORK ADDITION. Decides from a message's fields whether it is control traffic rather than
+    /// conversation. Such a message is still stored, but it never raises a conversation's unread
+    /// count and never moves its preview or timestamp. `nil` (the default) keeps the upstream
+    /// behaviour, where everything inbound counts.
+    ///
+    /// A closure rather than a set of field keys because the same key can carry either kind —
+    /// `FIELD_APP_DATA` holds both replies and a legacy client's reactions — so only the host's
+    /// own decoders can tell them apart. Called inside the write transaction, so it must stay pure.
+    private let isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)?
+
     // MARK: - Initialization
 
     /// Create or open LXMF database.
     ///
-    /// - Parameter path: Database file path
+    /// - Parameters:
+    ///   - path: Database file path
+    ///   - isSilentMessage: see ``isSilentMessage``
     /// - Throws: DatabaseError if initialization fails
-    public init(path: String, readonly: Bool = false) throws {
+    public init(path: String,
+                readonly: Bool = false,
+                isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)? = nil) throws {
+        self.isSilentMessage = isSilentMessage
         // App <-> Network-Extension share this database across processes (Model B).
         // The writer (the NE) must survive iOS's 0xDEAD10CC "file busy while suspended"
         // kill; the app opens read-only with `readonly: true`. (GRDB DatabaseSharing.)
@@ -183,6 +198,15 @@ public actor LXMFDatabase {
             try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
         }
 
+        // v7: Edit / delete-for-everyone annotations on messages
+        migrator.registerMigration("v7_message_annotations") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "edited_content", .blob)
+                t.add(column: "edited_at", .double)
+                t.add(column: "deleted_at", .double)
+            }
+        }
+
         return migrator
     }
 
@@ -228,13 +252,30 @@ public actor LXMFDatabase {
     /// - Throws: DatabaseError or LXMFError if save fails
     public func saveMessage(_ message: LXMessage) throws {
         try dbPool.write { db in
+            let existing = try MessageRecord.filter(Column("message_id") == message.hash).fetchOne(db)
+            // A message deleted for everyone stays erased: the router may still hold the original in
+            // memory and re-save it on a state change, which must not bring the content back.
+            if existing?.deletedAt != nil {
+                try db.execute(sql: "UPDATE messages SET state = ?, updated_at = ? WHERE message_id = ?",
+                               arguments: [message.state.rawValue, Date().timeIntervalSince1970, message.hash])
+                return
+            }
+
             // Update/create conversation FIRST (foreign key requires it)
             try self.updateConversationForMessage(message, in: db)
 
-            // Create message record
-            let record = try MessageRecord(from: message)
+            var record = try MessageRecord(from: message)
 
-            // Save message (insert or replace)
+            // The router re-saves a message on every state change; a plain replace would wipe
+            // the annotations (reactions, edits, deletion) that were applied to the row since.
+            if let existing {
+                record.replyToId = record.replyToId ?? existing.replyToId
+                record.reactionsJson = existing.reactionsJson
+                record.editedContent = existing.editedContent
+                record.editedAt = existing.editedAt
+                record.deletedAt = existing.deletedAt
+                record.createdAt = existing.createdAt
+            }
             try record.save(db)
         }
     }
@@ -246,9 +287,10 @@ public actor LXMFDatabase {
     /// - Throws: DatabaseError or LXMFError if retrieval fails
     public func getMessage(id: Data) throws -> LXMessage? {
         try dbPool.read { db in
+            // A deleted message's packed bytes are erased; there is no message left to unpack.
             guard let record = try MessageRecord
                 .filter(Column("message_id") == id)
-                .fetchOne(db) else {
+                .fetchOne(db), record.deletedAt == nil else {
                 return nil
             }
             return try record.toLXMessage()
@@ -281,7 +323,7 @@ public actor LXMFDatabase {
     public func getMessages(forConversation hash: Data, limit: Int = 50, offset: Int = 0) throws -> [LXMessage] {
         try dbPool.read { db in
             let records = try MessageRecord
-                .filter(Column("conversation_hash") == hash)
+                .filter(Column("conversation_hash") == hash && Column("deleted_at") == nil)
                 .order(Column("timestamp").desc)
                 .limit(limit, offset: offset)
                 .fetchAll(db)
@@ -575,6 +617,8 @@ public actor LXMFDatabase {
                         && (Column("method") == LXDeliveryMethod.opportunistic.rawValue
                             || Column("method") == LXDeliveryMethod.direct.rawValue))
                 )
+                // Erased rows can't be unpacked, and one would fail the whole load at startup.
+                .filter(Column("deleted_at") == nil)
                 .order(Column("timestamp").asc)
                 .fetchAll(db)
 
@@ -591,7 +635,7 @@ public actor LXMFDatabase {
     public func loadFailedOutbound() throws -> [LXMessage] {
         try dbPool.read { db in
             let records = try MessageRecord
-                .filter(Column("state") == LXMessageState.failed.rawValue)
+                .filter(Column("state") == LXMessageState.failed.rawValue && Column("deleted_at") == nil)
                 .order(Column("timestamp").desc)
                 .fetchAll(db)
 
@@ -628,6 +672,85 @@ public actor LXMFDatabase {
                 sql: "UPDATE messages SET reactions_json = ?, updated_at = ? WHERE message_id = ?",
                 arguments: [reactionsJson, Date().timeIntervalSince1970, messageId]
             )
+        }
+    }
+
+    /// Read-modify-write of one message's reactions JSON inside a single transaction, so two
+    /// concurrent toggles can't both read the old value and lose one of the updates.
+    ///
+    /// - Parameters:
+    ///   - messageId: Message hash (32 bytes)
+    ///   - transform: Given the stored record, returns the new reactions JSON (`nil` = leave the
+    ///     row untouched) and a result to hand back to the caller
+    /// - Returns: The transform's result, or `nil` if no such message exists
+    /// - Throws: DatabaseError
+    public func updateReactions<Result: Sendable>(
+        messageId: Data,
+        _ transform: @Sendable (MessageRecord) -> (reactionsJson: String?, result: Result)
+    ) throws -> Result? {
+        try dbPool.write { db in
+            guard let record = try MessageRecord.filter(Column("message_id") == messageId).fetchOne(db) else {
+                return nil
+            }
+            let outcome = transform(record)
+            if let json = outcome.reactionsJson {
+                try db.execute(
+                    sql: "UPDATE messages SET reactions_json = ?, updated_at = ? WHERE message_id = ?",
+                    arguments: [json, Date().timeIntervalSince1970, messageId]
+                )
+            }
+            return outcome.result
+        }
+    }
+
+    /// Deletes a message for everyone: sets `deleted_at` and erases its content, title, fields,
+    /// packed bytes, reply link and reactions, keeping the row as a tombstone. One transaction.
+    ///
+    /// A pending outbound row is also cancelled so it is never loaded for sending again, and the
+    /// conversation's preview is rebuilt from its newest message that still has text.
+    ///
+    /// - Parameters:
+    ///   - messageId: Message hash (32 bytes)
+    ///   - deletedAt: When it was deleted, in the deleter's clock
+    ///   - isAllowed: Checked against the stored row before anything changes
+    /// - Returns: What happened; a second call on a deleted row returns `.alreadyDeleted`
+    public func markDeleted(messageId: Data,
+                            at deletedAt: Double,
+                            isAllowed: @Sendable (MessageRecord) -> Bool = { _ in true }) throws -> MessageDeletionOutcome {
+        try dbPool.write { db in
+            guard let record = try MessageRecord.filter(Column("message_id") == messageId).fetchOne(db) else {
+                return .notFound
+            }
+            guard record.deletedAt == nil else { return .alreadyDeleted }
+            guard isAllowed(record) else { return .notAllowed }
+
+            let pendingStates = [LXMessageState.generating, .outbound, .sending].map(\.rawValue)
+            let state = !record.incoming && pendingStates.contains(record.state)
+                ? LXMessageState.cancelled.rawValue
+                : record.state
+            try db.execute(
+                sql: """
+                UPDATE messages
+                SET deleted_at = ?, content = ?, title = ?, fields = NULL, packed_lxmf = ?,
+                    reply_to_id = NULL, reactions_json = NULL, edited_content = NULL, edited_at = NULL,
+                    state = ?, updated_at = ?
+                WHERE message_id = ?
+                """,
+                arguments: [deletedAt, Data(), Data(), Data(), state, Date().timeIntervalSince1970, messageId]
+            )
+            let latestText = try Data.fetchOne(
+                db,
+                sql: """
+                SELECT content FROM messages
+                WHERE conversation_hash = ? AND deleted_at IS NULL AND length(content) > 0
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                arguments: [record.conversationHash]
+            )
+            let preview = latestText.flatMap { String(data: $0, encoding: .utf8) }.map { String($0.prefix(100)) }
+            try db.execute(sql: "UPDATE conversations SET last_message_preview = ? WHERE destination_hash = ?",
+                           arguments: [preview, record.conversationHash])
+            return .deleted
         }
     }
 
@@ -709,6 +832,13 @@ public actor LXMFDatabase {
     private func updateConversationForMessage(_ message: LXMessage, in db: Database) throws {
         let conversationHash = message.incoming ? message.sourceHash : message.destinationHash
 
+        // FORK ADDITION. Control traffic leaves the conversation alone — see `isSilentMessage`.
+        // The row is still ensured, because the message's own foreign key needs it.
+        guard !isSilent(message) else {
+            try ensureConversationRow(conversationHash, in: db)
+            return
+        }
+
         // Try to fetch existing conversation
         if var conversation = try ConversationRecord
             .filter(Column("destination_hash") == conversationHash)
@@ -751,5 +881,24 @@ public actor LXMFDatabase {
 
             try conversation.insert(db)
         }
+    }
+
+    /// FORK ADDITION. Whether this message is control traffic: the host recognises its fields and
+    /// it says nothing of its own.
+    ///
+    /// The content check is the fork's own guard rather than the host's business — a control field
+    /// is also legal on a message that carries text, and that one is a real message.
+    private func isSilent(_ message: LXMessage) -> Bool {
+        guard let isSilentMessage, message.content.isEmpty else { return false }
+        return isSilentMessage(message.fields)
+    }
+
+    /// The empty row a stored message's foreign key needs, for a conversation nothing has been
+    /// said in yet. Leaves an existing row untouched.
+    private func ensureConversationRow(_ conversationHash: Data, in db: Database) throws {
+        guard try ConversationRecord
+            .filter(Column("destination_hash") == conversationHash)
+            .fetchCount(db) == 0 else { return }
+        try ConversationRecord(destinationHash: conversationHash, lastMessageTimestamp: 0).insert(db)
     }
 }

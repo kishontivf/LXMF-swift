@@ -17,14 +17,14 @@ import XCTest
 import ReticulumSwift
 
 final class LXMFDatabaseTests: XCTestCase {
-    private func makeDatabase() throws -> LXMFDatabase {
+    private func makeDatabase(isSilentMessage: (@Sendable ([UInt8: Any]?) -> Bool)? = nil) throws -> LXMFDatabase {
         let dbPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("lxmf-db-tests-\(UUID().uuidString).db")
             .path
         addTeardownBlock {
             try? FileManager.default.removeItem(atPath: dbPath)
         }
-        return try LXMFDatabase(path: dbPath)
+        return try LXMFDatabase(path: dbPath, isSilentMessage: isSilentMessage)
     }
 
     // MARK: - Database Creation Tests
@@ -303,5 +303,209 @@ final class LXMFDatabaseTests: XCTestCase {
         XCTAssertEqual(conversations.count, 1, "Should have 1 conversation")
         XCTAssertEqual(conversations[0].unreadCount, 1, "Unread count should be 1 for incoming message")
         XCTAssertTrue(conversations[0].hasUnreadMessages, "hasUnreadMessages should be true")
+    }
+
+    /// FORK ADDITION. Control traffic is stored but says nothing: no unread, no preview, no
+    /// timestamp — so no compensating decrement is needed after the host drops the envelope.
+    func testSilentMessageLeavesConversationAlone() async throws {
+        let commandField: UInt8 = 0xC0
+        let db = try makeDatabase(isSilentMessage: { $0?[commandField] != nil })
+
+        let source = Identity()
+        let chat = try Self.incomingMessage(content: "Real message", fields: nil, from: source)
+        try await db.saveMessage(chat)
+        let command = try Self.incomingMessage(content: "", fields: [commandField: ["id", "a.command"] as [Any]],
+                                               from: source)
+        try await db.saveMessage(command)
+
+        let conversations = try await db.getConversations()
+        XCTAssertEqual(conversations.count, 1)
+        XCTAssertEqual(conversations[0].unreadCount, 1, "Only the chat message counts")
+        XCTAssertEqual(conversations[0].lastMessagePreview, "Real message", "A command must not move the preview")
+        XCTAssertEqual(conversations[0].lastMessageTimestamp, chat.timestamp, accuracy: 0.001)
+    }
+
+    /// The same field on a message that also says something is a real message.
+    func testSilentPredicateIgnoresMessagesWithContent() async throws {
+        let commandField: UInt8 = 0xC0
+        let db = try makeDatabase(isSilentMessage: { $0?[commandField] != nil })
+
+        let message = try Self.incomingMessage(content: "Said something",
+                                               fields: [commandField: ["id", "a.command"] as [Any]])
+        try await db.saveMessage(message)
+
+        let conversations = try await db.getConversations()
+        XCTAssertEqual(conversations[0].unreadCount, 1)
+    }
+
+    /// The router opens its own store, and it is the one that saves an inbound message — so the
+    /// rule has to reach that instance, not only a host's separate handle on the same file.
+    func testRouterStoreGetsTheSilenceRule() async throws {
+        let commandField: UInt8 = 0xC0
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxmf-router-silence-\(UUID().uuidString).db")
+            .path
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        let router = try await LXMRouter(identity: Identity(), databasePath: dbPath,
+                                         isSilentMessage: { $0?[commandField] != nil })
+        let command = try Self.incomingMessage(content: "",
+                                               fields: [commandField: ["id", "a.command"] as [Any]])
+        try await router.database.saveMessage(command)
+
+        let conversations = try await router.database.getConversations()
+        XCTAssertEqual(conversations.first?.unreadCount, 0)
+    }
+
+    /// An incoming message, the way the router hands one over: packed, then unpacked again.
+    private static func incomingMessage(content: String,
+                                        fields: [UInt8: Any]?,
+                                        from sourceIdentity: Identity = Identity()) throws -> LXMessage {
+        var message = LXMessage(
+            destinationHash: Identity().hash,
+            sourceIdentity: sourceIdentity,
+            content: content.data(using: .utf8)!,
+            title: Data(),
+            fields: fields,
+            desiredMethod: .direct
+        )
+        let packed = try message.pack()
+        var incoming = try LXMessage.unpackFromBytes(packed)
+        incoming.state = .delivered
+        return incoming
+    }
+
+    // MARK: - Annotation Tests
+
+    /// A router re-save (state change) must not wipe reactions applied to the row since.
+    func testResaveKeepsReactions() async throws {
+        let db = try makeDatabase()
+
+        var message = LXMessage(
+            destinationHash: Identity().hash,
+            sourceIdentity: Identity(),
+            content: "Reacted to".data(using: .utf8)!,
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try message.pack()
+        try await db.saveMessage(message)
+        try await db.updateReactions(messageId: message.hash, reactionsJson: #"{"👍":["abcd"]}"#)
+
+        message.state = .delivered
+        try await db.saveMessage(message)
+
+        let reactions = try await db.getReactionsJson(messageId: message.hash)
+        XCTAssertEqual(reactions, #"{"👍":["abcd"]}"#)
+        let record = try await db.getMessageRecord(id: message.hash)
+        XCTAssertEqual(record?.state, LXMessageState.delivered.rawValue)
+    }
+
+    /// The standard FIELD_REPLY_TO (0x30) carries raw hash bytes; the record keeps them as hex.
+    func testReplyToFromStandardField() async throws {
+        let db = try makeDatabase()
+        let target = Data((0..<32).map { UInt8($0) })
+
+        var message = LXMessage(
+            destinationHash: Identity().hash,
+            sourceIdentity: Identity(),
+            content: "Reply".data(using: .utf8)!,
+            title: Data(),
+            fields: [LXMessage.FIELD_REPLY_TO: target],
+            desiredMethod: .direct
+        )
+        _ = try message.pack()
+        try await db.saveMessage(message)
+
+        let record = try await db.getMessageRecord(id: message.hash)
+        XCTAssertEqual(record?.replyToId, target.map { String(format: "%02x", $0) }.joined())
+    }
+
+    // MARK: - Deletion Tests
+
+    private func savedMessage(_ db: LXMFDatabase, content: String, destination: Data,
+                              state: LXMessageState = .delivered) async throws -> LXMessage {
+        var message = LXMessage(destinationHash: destination, sourceIdentity: Identity(),
+                                content: Data(content.utf8), title: Data(), fields: nil, desiredMethod: .direct)
+        _ = try message.pack()
+        message.state = state
+        try await db.saveMessage(message)
+        return message
+    }
+
+    /// Deleting erases the content but keeps the row, and a second delete changes nothing.
+    func testMarkDeletedErasesOnceAndKeepsTheRow() async throws {
+        let db = try makeDatabase()
+        let message = try await savedMessage(db, content: "secret", destination: Identity().hash)
+
+        let first = try await db.markDeleted(messageId: message.hash, at: 1_000)
+        let second = try await db.markDeleted(messageId: message.hash, at: 2_000)
+
+        XCTAssertEqual(first, .deleted)
+        XCTAssertEqual(second, .alreadyDeleted)
+        let stored = try await db.getMessageRecord(id: message.hash)
+        let record = try XCTUnwrap(stored)
+        XCTAssertEqual(record.deletedAt, 1_000)
+        XCTAssertTrue(record.content.isEmpty)
+        XCTAssertTrue(record.packedLxmf.isEmpty)
+        let fetched = try await db.getMessage(id: message.hash)
+        XCTAssertNil(fetched, "an erased row has nothing to unpack")
+    }
+
+    func testMarkDeletedHonoursTheCallersCheck() async throws {
+        let db = try makeDatabase()
+        let message = try await savedMessage(db, content: "keep", destination: Identity().hash)
+
+        let outcome = try await db.markDeleted(messageId: message.hash, at: 1_000, isAllowed: { _ in false })
+
+        XCTAssertEqual(outcome, .notAllowed)
+        let record = try await db.getMessageRecord(id: message.hash)
+        XCTAssertNil(record?.deletedAt)
+        let missing = try await db.markDeleted(messageId: Data(repeating: 1, count: 32), at: 1_000)
+        XCTAssertEqual(missing, .notFound)
+    }
+
+    /// The router re-saves a message on state changes; that must not bring deleted content back.
+    func testResaveOfADeletedMessageStaysErased() async throws {
+        let db = try makeDatabase()
+        var message = try await savedMessage(db, content: "secret", destination: Identity().hash, state: .sending)
+        _ = try await db.markDeleted(messageId: message.hash, at: 1_000)
+
+        message.state = .failed
+        try await db.saveMessage(message)
+
+        let stored = try await db.getMessageRecord(id: message.hash)
+        let record = try XCTUnwrap(stored)
+        XCTAssertTrue(record.content.isEmpty)
+        XCTAssertEqual(record.deletedAt, 1_000)
+        XCTAssertEqual(record.state, LXMessageState.failed.rawValue)
+    }
+
+    /// A deleted outbound message is cancelled, so the router never loads it for sending again.
+    func testDeletedPendingMessageIsNotLoadedForSending() async throws {
+        let db = try makeDatabase()
+        let message = try await savedMessage(db, content: "unsent", destination: Identity().hash, state: .outbound)
+
+        _ = try await db.markDeleted(messageId: message.hash, at: 1_000)
+
+        let pending = try await db.loadPendingOutbound()
+        XCTAssertFalse(pending.contains { $0.hash == message.hash })
+        let record = try await db.getMessageRecord(id: message.hash)
+        XCTAssertEqual(record?.state, LXMessageState.cancelled.rawValue)
+    }
+
+    /// The conversation list must not keep showing the deleted text.
+    func testDeletingTheNewestMessageRebuildsThePreview() async throws {
+        let db = try makeDatabase()
+        let destination = Identity().hash
+        _ = try await savedMessage(db, content: "older", destination: destination)
+        try await Task.sleep(for: .milliseconds(20))
+        let newest = try await savedMessage(db, content: "regret", destination: destination)
+
+        _ = try await db.markDeleted(messageId: newest.hash, at: 1_000)
+
+        let conversation = try await db.getConversation(hash: destination)
+        XCTAssertEqual(conversation?.lastMessagePreview, "older")
     }
 }
