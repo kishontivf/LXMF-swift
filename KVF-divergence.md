@@ -34,6 +34,7 @@ themselves a divergence and are listed under [D3](#d3) below.
 | [D9](#d9) | Router (outbound) | Pathless retry: attempt refund, exponential backoff, unproven-route invalidation | `457eb4e` | D1, D4 |
 | [D10](#d10) | Storage | `countMessages(forConversation:)` conversation counter | `ed7ee1d` | — |
 | [D11](#d11) | Package.swift, Storage | GRDB 7 + SWCompression 4.9; platform floor macOS 14 / iOS 17 | _uncommitted_ | — |
+| [D12](#d12) | Router (inbound) | Host delivery policy (`setDeliveryPolicy`) before dedup/storage; proof sent after admission | _uncommitted_ | D3 |
 
 ### Commit ledger
 
@@ -374,6 +375,32 @@ adapted when pulled in, and the static strategies won't fail the build.
 
 ---
 
+## D12 — Host delivery policy and proof-after-admission {#d12}
+
+**Commits:** _uncommitted_
+
+**Files:** `Sources/LXMFSwift/Router/LXMRouter.swift` (`LXDeliveryOutcome`, `LXDeliveryPolicy`,
+`setDeliveryPolicy`, `deliver`, `shouldProve`; `lxmfDelivery` is now a Bool wrapper),
+`Sources/LXMFSwift/Router/LXMRouter+Destinations.swift` (`deliveryPacket`),
+`Sources/LXMFSwift/Router/LXMRouterDelegate.swift`, `port-deviations.md`,
+`Tests/LXMFSwiftTests/LXMRouterDeliveryPolicyTests.swift`
+
+Upstream (and python) proves an inbound packet before unpacking it and has no host admission
+hook in the Swift port (python's `ignored_list` was never ported). The host app admits only its
+contacts and must not prove to a blocked sender.
+
+- `setDeliveryPolicy(_:)` installs an async `(sourceHash, fields) -> Bool`, consulted after the
+  signature/unverified checks and **before** `recordDelivered`, so a rejected hash is not
+  blacklisted and is accepted once the host allows the source.
+- `deliveryPacket` now proves **after** `deliver`, and skips the proof only for
+  `.rejectedByPolicy`; duplicates and parse failures still prove.
+- Resource transfers are proved inside reticulum-swift (`Resource.assemble`) before LXMF runs,
+  so a policy-rejected resource is still proved.
+
+**Known gap:** same as [D3](#d3) for `.propagated` — the sync ACKs every transient ID, so a
+policy-rejected message pulled from a propagation node is deleted there for good. That is the
+intended outcome for a blocked or unknown sender.
+
 ## Re-sync checklist
 
 When pulling new upstream work:
@@ -440,6 +467,7 @@ HEAD the file described at that point.
 
 | Date | Covers | Change |
 |------|--------|--------|
+| 2026-09-25 | `3aa1b8b` + uncommitted | Added [D12](#d12) (host delivery policy, proof after admission). |
 | 2026-09-15 | `ef0c712` + uncommitted | Added [D11](#d11) (GRDB 7, SWCompression 4.9, macOS 14 / iOS 17) and [D6](#d6)'s tests; D1 no longer carries SWCompression; re-sync checklist gains the GRDB 6 API grep. Commits `19f7c6b`, `49061a6`, `93e3d0c` since `457eb4e` are not yet audited into the ledger. |
 | 2026-08-19 | `457eb4e` | Added [D8](#d8) (queue diagnostics), [D9](#d9) (pathless retry / unproven-route invalidation) and [D10](#d10) (message count). Corrected [D1](#d1): reticulum floor is 0.4.3 and the SWCompression pin went back to upstream's range. Refreshed the ledger, re-sync checklist and status. |
 | 2026-08-02 | `e719af4` | Added [Status at generation](#status) and this changelog. |

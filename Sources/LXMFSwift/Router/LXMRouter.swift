@@ -25,6 +25,21 @@ import os.log
 
 private let routerLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMRouter")
 
+/// Why a delivered message did not, or did, reach the store. Distinguishes a policy rejection
+/// from every other failure because only a policy rejection withholds the delivery proof:
+/// the sender should see an unreachable peer, not a confirmed delivery.
+public enum LXDeliveryOutcome: Sendable, Equatable {
+    case accepted
+    case duplicate
+    case rejectedByPolicy
+    case rejected
+}
+
+/// Host-supplied admission rule, consulted after signature validation and before dedup and
+/// storage. `nil` admits everything (python parity). Python LXMF checks its `ignored_list` at
+/// this point; see port-deviations.md.
+public typealias LXDeliveryPolicy = @Sendable (_ sourceHash: Data, _ fields: [UInt8: Any]?) async -> Bool
+
 /// LXMF message router actor.
 ///
 /// Manages outbound message queues, processes delivery attempts, handles incoming messages,
@@ -322,6 +337,18 @@ public actor LXMRouter {
         acceptUnverifiedMessages = enabled
     }
 
+    private var deliveryPolicy: LXDeliveryPolicy?
+
+    public func setDeliveryPolicy(_ policy: LXDeliveryPolicy?) {
+        deliveryPolicy = policy
+    }
+
+    /// The proof is withheld only when the policy said no: a duplicate or a parse failure still
+    /// proves, as python does, so a sender whose first proof was lost is not left retrying.
+    public static func shouldProve(_ outcome: LXDeliveryOutcome) -> Bool {
+        outcome != .rejectedByPolicy
+    }
+
     // MARK: - Delegate Wrapper
 
     /// Wrapper for weak delegate reference in actor context.
@@ -554,6 +581,17 @@ public actor LXMRouter {
         physicalStats: PhysicalStats? = nil,
         method: LXDeliveryMethod? = nil
     ) async -> Bool {
+        await deliver(data, physicalStats: physicalStats, method: method) == .accepted
+    }
+
+    /// The full inbound pipeline with a typed outcome. `lxmfDelivery` keeps the python-shaped
+    /// Bool for existing callers; `deliveryPacket` needs the outcome to decide about the proof.
+    @discardableResult
+    public func deliver(
+        _ data: Data,
+        physicalStats: PhysicalStats? = nil,
+        method: LXDeliveryMethod? = nil
+    ) async -> LXDeliveryOutcome {
         let dataHex = data.prefix(16).map { String(format: "%02x", $0) }.joined()
         routerLogger.info("Entry: \(data.count) bytes, prefix=\(dataHex), method=\(String(describing: method))")
 
@@ -562,7 +600,7 @@ public actor LXMRouter {
             // LXMF format: [dest_hash 16B][src_hash 16B][signature 64B][payload...]
             guard data.count >= 32 else {
                 routerLogger.warning("REJECTED: too short (\(data.count) < 32)")
-                return false
+                return .rejected
             }
             let destinationHash = data.subdata(in: 0..<16)
             let sourceHash = data.subdata(in: 16..<32)
@@ -604,7 +642,7 @@ public actor LXMRouter {
                 && destinationHash != localDeliveryHash
                 && method != .propagated {
                 routerLogger.info("REJECTED: self-echo from \(srcHex) via \(String(describing: method))")
-                return false
+                return .rejected
             }
 
             // Look up source identity from cache for signature validation
@@ -628,7 +666,7 @@ public actor LXMRouter {
             // message: drop it silently (Python parity).
             if message.unverifiedReason == .signatureInvalid {
                 routerLogger.warning("REJECTED: invalid signature from \(srcHex)")
-                return false
+                return .rejected
             }
 
             // A message from a source whose identity we cannot recall is
@@ -644,13 +682,21 @@ public actor LXMRouter {
             // with `setAcceptUnverifiedMessages(true)`. See port-deviations.md.
             if message.signatureValidated == false && !acceptUnverifiedMessages {
                 routerLogger.warning("REJECTED: unverified source \(srcHex) (\(String(describing: message.unverifiedReason)))")
-                return false
+                return .rejected
+            }
+
+            // Host admission rule (e.g. "known contacts only"). Before dedup on purpose: a
+            // rejected message is not remembered, so the same bytes are accepted once the
+            // host allows the source, without the sender having to change anything.
+            if let deliveryPolicy, await deliveryPolicy(sourceHash, message.fields) == false {
+                routerLogger.info("REJECTED: delivery policy declined source \(srcHex) hash=\(msgHashHex)")
+                return .rejectedByPolicy
             }
 
             // Check duplicate (transient ID = message hash)
             if deliveredTransientIDs[message.hash] != nil {
                 routerLogger.info("REJECTED: duplicate hash=\(msgHashHex)")
-                return false
+                return .duplicate
             }
 
             // Record as delivered: cache + prune + persist so dedup survives a restart.
@@ -683,7 +729,7 @@ public actor LXMRouter {
                 // the entry on a failed store — see port-deviations.md.
                 deliveredTransientIDs.removeValue(forKey: message.hash)
                 deliveredCacheDirty = true
-                return false
+                return .rejected
             }
 
             // Invoke delegate callback on main actor
@@ -695,13 +741,13 @@ public actor LXMRouter {
                 }
             }
 
-            return true
+            return .accepted
 
         } catch {
             // Invalid message format, signature failed, etc.
             // Python silently drops malformed messages
             routerLogger.error("REJECTED: unpack/validation error: \(error)")
-            return false
+            return .rejected
         }
     }
 

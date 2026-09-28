@@ -25,8 +25,9 @@ public protocol LXMRouterDelegate: AnyObject, Sendable {
 
     /// Called when a message is received and validated.
     ///
-    /// The message has already been validated (signature check passed),
-    /// duplicate detection passed, stamp validated if required, and stored in database.
+    /// The message has already been validated (signature check passed), admitted by the
+    /// host's delivery policy when one is set, duplicate detection passed, stamp validated
+    /// if required, and stored in database.
     ///
     /// Unless `acceptUnverifiedMessages` was set on the router, `message.signatureValidated`
     /// is guaranteed `true` here: unverified messages (invalid signature or unknown

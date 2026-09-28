@@ -131,10 +131,10 @@ extension LXMRouter {
     /// Handle delivery packet received for LXMF destination.
     ///
     /// This is called when a packet arrives for a registered LXMF destination.
-    /// IMPORTANT: Sends delivery proof FIRST, then unpacks and validates the message.
+    /// Unpacks and validates the message, then proves the packet unless the host's delivery
+    /// policy rejected it (python proves first, before validation — see port-deviations.md).
     ///
     /// Reference: Python LXMF/LXMRouter.py delivery_packet() lines 1817-1818
-    /// The proof is sent immediately upon packet reception, before message validation.
     ///
     /// - Parameters:
     ///   - data: Packet data
@@ -142,11 +142,6 @@ extension LXMRouter {
     public func deliveryPacket(_ data: Data, _ packet: Packet) async {
         let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.info("deliveryPacket: destType=\(String(describing: packet.header.destinationType)), destHash=\(destHex), dataLen=\(data.count)")
-
-        // STEP 1: Send delivery proof IMMEDIATELY (before unpacking)
-        // Reference: Python Packet.prove() -> Identity.prove()
-        // The proof proves we received the packet by signing its hash
-        await sendDeliveryProof(for: packet)
 
         // STEP 2: Reconstruct full LXMF data based on packet type and classify the
         // delivery method. Mirrors Python LXMRouter.delivery_packet() lines 1820-1828:
@@ -174,8 +169,15 @@ extension LXMRouter {
         // STEP 3: Route to delivery handler for unpacking and validation
         let stats = PhysicalStats(receivingInterface: packet.receivingInterface)
         routerLogger.info("Calling lxmfDelivery() with \(lxmfData.count) bytes, method=\(String(describing: method)), interface=\(packet.receivingInterface ?? "nil")")
-        let accepted = await lxmfDelivery(lxmfData, physicalStats: stats, method: method)
-        routerLogger.info("lxmfDelivery() returned accepted=\(accepted)")
+        let outcome = await deliver(lxmfData, physicalStats: stats, method: method)
+        routerLogger.info("deliver() returned \(String(describing: outcome))")
+
+        // Proof AFTER admission (python proves first). A policy-rejected packet is left unproven
+        // so the sender sees an unreachable peer rather than a confirmed delivery; every other
+        // outcome proves, exactly as before. Reference: Python Packet.prove() -> Identity.prove().
+        if Self.shouldProve(outcome) {
+            await sendDeliveryProof(for: packet)
+        }
     }
 
     /// Send a delivery proof for a received packet.

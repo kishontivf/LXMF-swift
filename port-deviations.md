@@ -702,6 +702,24 @@ another **non-fallback** interface and no resource is in flight. A route that mo
 
 **Upstream-worthy:** partly — the "interface gone" case is general; the fallback rule is ours.
 
+### `lxmfDelivery` — host delivery policy, proof after admission
+
+**Sites:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `deliver(_:physicalStats:method:)`,
+`setDeliveryPolicy(_:)`, `LXDeliveryOutcome`; `LXMRouter+Destinations.swift` — `deliveryPacket`.
+Tests: `LXMRouterDeliveryPolicyTests.swift`.
+
+**Python reference:** `LXMRouter.py` `lxmf_delivery` checks `self.ignored_list` after signature
+validation; `delivery_packet` calls `packet.prove()` before unpacking.
+
+**Swift change:** a host-installed async policy `(sourceHash, fields) -> Bool` replaces the static
+ignore list and runs before dedup and storage, and the opportunistic/link proof is sent only when
+the outcome is not `.rejectedByPolicy`. Duplicates and parse failures still prove. Resources are
+proved by reticulum-swift before LXMF sees them, so they are unaffected.
+
+**Reason:** Category (b) — the host app needs "known contacts only", and a blocked sender must not
+receive a delivery proof. **Upstream-worthy:** the policy hook yes; the proof ordering is a
+behavioural deviation and should stay documented here.
+
 ## Resolved deviations
 
 (none yet — this file was created during the iOS smoke-pipeline
