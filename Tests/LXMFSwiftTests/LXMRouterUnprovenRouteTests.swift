@@ -43,7 +43,7 @@ final class LXMRouterUnprovenRouteTests: XCTestCase {
         PathEntry(
             destinationHash: destinationHash,
             publicKeys: Data(repeating: 0x01, count: 64),
-            interfaceId: "argonath.paydogs.hu",
+            interfaceId: "test.analog.app",
             hopCount: 4,
             expires: Date().addingTimeInterval(3600),
             randomBlob: Data(repeating: 0x02, count: 10)
